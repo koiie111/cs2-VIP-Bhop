@@ -21,8 +21,8 @@ A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStri
 
 1. С `sv_autobunnyhopping` и `sv_enablebunnyhopping` снимается флаг `FCVAR_REPLICATED`, и сервер больше не рассылает их всем.
 2. Каждому клиенту значение отправляется отдельно (`CNETMsg_SetConVar` одному получателю) и только при изменении: VIP с активным бхопом получает `true`, остальные — реальное значение сервера.
-3. Перехватываются две функции: `CBasePlayerController::OnSimulateUserCommands` (начало обработки команд игрока, до `SetupMove`) и `CCSPlayer_MovementServices::ProcessMovement`. В обеих точках для **каждого** игрока в память пишется его значение: VIP получает `true`, остальные — реальное значение сервера. Колбэки изменения не вызываются, рассылки нет.
-4. Раз значение выставляется в начале обработки каждого игрока, код движения никогда не видит значение другого игрока, и post-хук не нужен (на CSS 1.0.375+ он не срабатывает). Кроме того, реальное значение возвращается после фазы обработки сущностей и каждый тик.
+3. Перехватывается `CBasePlayerController::OnSimulateUserCommands`: внутри неё идёт вся обработка команд игрока (`SetupMove`, `ProcessMovement` и т.д.). Для VIP pre-хук пишет `true` прямо в память (без колбэков и рассылки), сам вызывает оригинальную функцию в обход хука, возвращает прежнее значение и пропускает оригинал. Так `true` существует только пока обрабатываются команды самого VIP.
+4. Post-хуки не нужны (на CSS 1.0.375+ они не срабатывают). `ProcessMovement` перехвачен как вторая страховка с той же логикой. Перед обработкой любого не-VIP и после фазы обработки сущностей плагин проверяет, что в памяти реальное значение.
 
 В итоге клиент и сервер считают движение VIP одинаково по встроенному автобхопу CS2.
 
@@ -82,13 +82,14 @@ A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStri
 [VIP Bhop] hook: OK
 [VIP Bhop] real values: sv_autobunnyhopping=False sv_enablebunnyhopping=False, overridden now: False
 [VIP Bhop] flags: ...
-[VIP Bhop] simulate=45000 ProcessMovement pre=50000 post=0 vip=30000 staleRestores=29000 (post hook not firing, fallback restore in use)
-[VIP Bhop] #0 Player: enabled=True active=True sent=True/True inMovementSet=True inControllerSet=True
+[VIP Bhop] simulate=45000 processMovement=50000 vipWrapped=30000 staleRestores=0 (must stay 0)
+[VIP Bhop] #0 Player: enabled=True active=True sent=True/True inMovementSet=True inControllerSet=True simulate/tick=1.00
 ```
 
 - `real values` должны совпадать с вашим `server.cfg`. Если там `True`, переменную включает конфиг или другой плагин, а не этот модуль. Проверьте так: `css_plugins unload VIP_Bhop`, затем `sv_autobunnyhopping`.
-- `simulate` и `pre` должны расти. Если `simulate=0`, хук начала обработки команд не срабатывает. Создайте issue и приложите вывод команды.
-- `post=0` на CSS 1.0.375+ (KHook) — это нормально, модуль от post-хука не зависит.
+- `simulate` и `processMovement` должны расти. Если `simulate=0`, хук начала обработки команд не срабатывает.
+- `staleRestores` должен оставаться `0`. Если он растёт, где-то значение подменено вне обработки VIP.
+- `simulate/tick` у каждого игрока должен быть около `1.00`. Если у кого-то заметно меньше, часть его команд обрабатывается вне игрового потока, где CSS не вызывает хуки плагинов. Тогда подмена переменной для этого игрока ненадёжна. Создайте issue и приложите вывод команды.
 - У обычных игроков должно быть `enabled=False sent=False/False inMovementSet=False inControllerSet=False`.
 - Если обычный игрок всё равно распрыгивается с зажатым пробелом, выполните `sv_autobunnyhopping` **в консоли его клиента**. Если там `true`, значение утекает к клиенту по сети (например, из-за устаревшего CSS). Если `false`, проблема на стороне сервера.
 
@@ -116,7 +117,7 @@ dotnet build VIP_Bhop.csproj -c Release
 - `FCVAR_REPLICATED` is removed from `sv_autobunnyhopping` and `sv_enablebunnyhopping`, so the server never broadcasts them.
 - Each client receives its own value through a single-recipient `CNETMsg_SetConVar`: `true` for an active VIP, the real server value for everyone else.
 - `CBasePlayerController::OnSimulateUserCommands` (before `SetupMove`) and `CCSPlayer_MovementServices::ProcessMovement` are hooked. At both points every player gets their own value written straight into memory: `true` for an active VIP, the real value for everyone else.
-- No post hook is needed (it does not fire on CSS 1.0.375+), and the override never leaks to other players.
+- For a VIP the hook sets `true`, calls the original itself (bypassing the hook), restores the previous value and skips the original, so `true` exists only while that VIP's own commands run. No post hook is needed (it does not fire on CSS 1.0.375+).
 
 **Install:**
 1. Remove the original `VIP_Bhop`.

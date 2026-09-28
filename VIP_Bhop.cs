@@ -17,7 +17,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.1.0";
+    public override string ModuleVersion => "v2.2.0";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -48,9 +48,10 @@ public class VIP_Bhop : BasePlugin
  *     never broadcasts these cvars to everyone.
  *  2. Each client gets its own value via CNETMsg_SetConVar (ReplicateConVar -> single recipient):
  *     VIP with active bhop gets "true", everyone else gets the real server value.
- *  3. Server-side the global value is swapped to "true" only for the duration of
- *     CCSPlayer_MovementServices::ProcessMovement of that VIP and restored right after.
- *     The value is written directly to memory, so no change callbacks / broadcasts fire.
+ *  3. Server-side the global value is set to "true" only while that VIP's own commands run:
+ *     the OnSimulateUserCommands pre hook writes "true" directly to memory (no change callbacks /
+ *     broadcasts), calls the original bypassing the hook, puts the previous value back and skips the
+ *     original. Post hooks are not needed (they do not fire on CSS 1.0.375+/KHook).
  * Client prediction and server movement agree -> native bhop without sticking or jitter.
  */
 public class Bhop : VipFeatureBase, IDisposable
@@ -79,15 +80,16 @@ public class Bhop : VipFeatureBase, IDisposable
     private readonly HashSet<IntPtr> _activeServices = new();
     private readonly HashSet<IntPtr> _activeControllers = new();
 
-    // Real server values. Captured only while no override is applied, so they can never pick up "true" from a VIP.
+    // Real server values, captured every tick (the override never outlives a VIP's own processing)
     private bool _realAutoBhop;
     private bool _realEnableBhop;
-    private bool _overridden;
 
     // Diagnostics (css_vipbhop_status)
+    private readonly Dictionary<IntPtr, int> _controllerSlots = new();
+    private readonly long[] _simulateBySlot = new long[65];
+    private readonly long[] _ticksBySlot = new long[65];
     private long _simulateCalls;
     private long _preCalls;
-    private long _postCalls;
     private long _vipCalls;
     private long _staleRestores;
 
@@ -104,17 +106,17 @@ public class Bhop : VipFeatureBase, IDisposable
             return;
         }
 
-        // Every player's command processing starts with OnSimulateUserCommands (it runs SetupMove, which already
-        // reads movement cvars, then ProcessMovement). Setting the per-player value at both entry points means
-        // no player ever runs with another player's value, and no post hook is needed (it does not fire on
-        // CSS 1.0.375+/KHook). Both hooks are required: with only one of them the override could leak.
+        // Every player's command processing runs inside OnSimulateUserCommands (SetupMove, ProcessMovement, ...).
+        // For a VIP the pre hook sets the cvars, calls the original itself (bypassing the hook), puts the values
+        // back and skips the original. So "true" exists only while that VIP's own commands run and never
+        // leaks to anyone, without relying on post hooks (they do not fire on CSS 1.0.375+/KHook).
+        // ProcessMovement is hooked too, as a second guard with the same logic.
         try
         {
             _simulateUserCommands = new MemoryFunctionVoid<IntPtr>(GameData.GetSignature(SimulateUserCommandsKey));
             _processMovement = new MemoryFunctionVoid<IntPtr, IntPtr>(GameData.GetSignature(ProcessMovementKey));
             _simulateUserCommands.Hook(SimulateUserCommandsPre, HookMode.Pre);
             _processMovement.Hook(ProcessMovementPre, HookMode.Pre);
-            _processMovement.Hook(ProcessMovementPost, HookMode.Post);
         }
         catch (Exception e)
         {
@@ -138,12 +140,7 @@ public class Bhop : VipFeatureBase, IDisposable
         plugin.RegisterListener<Listeners.OnClientConnected>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnClientDisconnectPost>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnTick>(OnTick);
-        // Player movement runs inside the entity think phase. Restore right after it, because the
-        // ProcessMovement post hook is not guaranteed to fire (it does not on CSS 1.0.375+/KHook).
-        plugin.RegisterListener<Listeners.OnServerPostEntityThink>(() =>
-        {
-            if (_overridden) Restore();
-        });
+        plugin.RegisterListener<Listeners.OnServerPostEntityThink>(EnsureRealValues);
         plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
         plugin.AddCommand("css_vipbhop_status", "VIP Bhop diagnostics", OnStatusCommand);
     }
@@ -184,13 +181,7 @@ public class Bhop : VipFeatureBase, IDisposable
     {
         _activeServices.Clear();
         _activeControllers.Clear();
-
-        // Safety net: an override must never survive until the next tick
-        if (_overridden)
-        {
-            _staleRestores++;
-            Restore();
-        }
+        _controllerSlots.Clear();
 
         _realAutoBhop = _autoBhop!.GetPrimitiveValue<bool>();
         _realEnableBhop = _enableBhop!.GetPrimitiveValue<bool>();
@@ -201,6 +192,9 @@ public class Bhop : VipFeatureBase, IDisposable
         {
             if (player is not { IsValid: true, IsBot: false, IsHLTV: false } ||
                 player.Connected != PlayerConnectedState.Connected) continue;
+
+            _controllerSlots[player.Handle] = player.Slot;
+            _ticksBySlot[player.Slot]++;
 
             var state = _states[player.Slot];
             var bhop = state.Enabled && state.Active;
@@ -240,47 +234,70 @@ public class Bhop : VipFeatureBase, IDisposable
     private HookResult SimulateUserCommandsPre(DynamicHook hook)
     {
         _simulateCalls++;
-        Apply(_activeControllers.Count > 0 && _activeControllers.Contains(hook.GetParam<IntPtr>(0)));
-        return HookResult.Continue;
+        var controller = hook.GetParam<IntPtr>(0);
+        if (_controllerSlots.TryGetValue(controller, out var slot)) _simulateBySlot[slot]++;
+
+        if (_activeControllers.Count == 0 || !_activeControllers.Contains(controller))
+        {
+            EnsureRealValues();
+            return HookResult.Continue;
+        }
+
+        RunWithBhop(() => _simulateUserCommands!.Invoke(controller, true));
+        return HookResult.Handled;
     }
 
     private HookResult ProcessMovementPre(DynamicHook hook)
     {
         _preCalls++;
-        Apply(_activeServices.Count > 0 && _activeServices.Contains(hook.GetParam<IntPtr>(0)));
-        return HookResult.Continue;
-    }
+        var services = hook.GetParam<IntPtr>(0);
 
-    private void Apply(bool vip)
-    {
-        if (vip)
+        if (_activeServices.Count == 0 || !_activeServices.Contains(services))
         {
-            _vipCalls++;
-            _autoBhop!.GetPrimitiveValue<bool>() = true;
-            _enableBhop!.GetPrimitiveValue<bool>() = true;
-            _overridden = true;
+            EnsureRealValues();
+            return HookResult.Continue;
         }
-        else if (_overridden)
+
+        // Normally already inside the VIP's OnSimulateUserCommands wrapper
+        if (_autoBhop!.GetPrimitiveValue<bool>() && _enableBhop!.GetPrimitiveValue<bool>())
+            return HookResult.Continue;
+
+        var moveData = hook.GetParam<IntPtr>(1);
+        RunWithBhop(() => _processMovement!.Invoke(services, moveData, true));
+        return HookResult.Handled;
+    }
+
+    private void RunWithBhop(Action original)
+    {
+        _vipCalls++;
+        ref var autoBhop = ref _autoBhop!.GetPrimitiveValue<bool>();
+        ref var enableBhop = ref _enableBhop!.GetPrimitiveValue<bool>();
+        var prevAutoBhop = autoBhop;
+        var prevEnableBhop = enableBhop;
+
+        autoBhop = true;
+        enableBhop = true;
+        try
         {
-            // The previous player was a VIP: this one must run with the real values
-            _staleRestores++;
-            Restore();
+            original();
+        }
+        finally
+        {
+            autoBhop = prevAutoBhop;
+            enableBhop = prevEnableBhop;
         }
     }
 
-    private HookResult ProcessMovementPost(DynamicHook hook)
+    // Guard: nobody but a VIP inside RunWithBhop may ever see a value other than the real one
+    private void EnsureRealValues()
     {
-        _postCalls++;
-        if (_overridden) Restore();
+        ref var autoBhop = ref _autoBhop!.GetPrimitiveValue<bool>();
+        ref var enableBhop = ref _enableBhop!.GetPrimitiveValue<bool>();
+        if (autoBhop == _realAutoBhop && enableBhop == _realEnableBhop) return;
 
-        return HookResult.Continue;
-    }
-
-    private void Restore()
-    {
-        _autoBhop!.GetPrimitiveValue<bool>() = _realAutoBhop;
-        _enableBhop!.GetPrimitiveValue<bool>() = _realEnableBhop;
-        _overridden = false;
+        _staleRestores++;
+        autoBhop = _realAutoBhop;
+        enableBhop = _realEnableBhop;
     }
 
     private void OnStatusCommand(CCSPlayerController? caller, CommandInfo info)
@@ -290,19 +307,20 @@ public class Bhop : VipFeatureBase, IDisposable
 
         info.ReplyToCommand($"[VIP Bhop] hook: {(IsWorking ? "OK" : "NOT INSTALLED")}");
         info.ReplyToCommand(
-            $"[VIP Bhop] real values: {AutoBhopName}={_realAutoBhop} {EnableBhopName}={_realEnableBhop}, overridden now: {_overridden}");
+            $"[VIP Bhop] real values: {AutoBhopName}={_realAutoBhop} {EnableBhopName}={_realEnableBhop}, " +
+            $"current: {_autoBhop?.GetPrimitiveValue<bool>()}/{_enableBhop?.GetPrimitiveValue<bool>()}");
         info.ReplyToCommand(
             $"[VIP Bhop] flags: {AutoBhopName}={_autoBhop?.Flags} {EnableBhopName}={_enableBhop?.Flags}");
         info.ReplyToCommand(
-            $"[VIP Bhop] simulate={_simulateCalls} ProcessMovement pre={_preCalls} post={_postCalls} vip={_vipCalls} staleRestores={_staleRestores}" +
-            (_postCalls == 0 && _preCalls > 0 ? " (post hook not firing, fallback restore in use)" : ""));
+            $"[VIP Bhop] simulate={_simulateCalls} processMovement={_preCalls} vipWrapped={_vipCalls} staleRestores={_staleRestores} (must stay 0)");
 
         foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
         {
             var st = _states[player.Slot];
             info.ReplyToCommand(
                 $"[VIP Bhop] #{player.Slot} {player.PlayerName}: enabled={st.Enabled} active={st.Active} " +
-                $"sent={st.SentAutoBhop}/{st.SentEnableBhop} inMovementSet={player.PlayerPawn.Value?.MovementServices is { } ms && _activeServices.Contains(ms.Handle)} inControllerSet={_activeControllers.Contains(player.Handle)}");
+                $"sent={st.SentAutoBhop}/{st.SentEnableBhop} inMovementSet={player.PlayerPawn.Value?.MovementServices is { } ms && _activeServices.Contains(ms.Handle)} inControllerSet={_activeControllers.Contains(player.Handle)} " +
+                $"simulate/tick={(_ticksBySlot[player.Slot] == 0 ? 0 : (double)_simulateBySlot[player.Slot] / _ticksBySlot[player.Slot]):0.00}");
         }
     }
 
@@ -374,9 +392,7 @@ public class Bhop : VipFeatureBase, IDisposable
 
         _simulateUserCommands?.Unhook(SimulateUserCommandsPre, HookMode.Pre);
         _processMovement.Unhook(ProcessMovementPre, HookMode.Pre);
-        _processMovement.Unhook(ProcessMovementPost, HookMode.Post);
-
-        if (_overridden) Restore();
+        EnsureRealValues();
 
         _autoBhop!.Flags = _autoBhopFlags;
         _enableBhop!.Flags = _enableBhopFlags;
