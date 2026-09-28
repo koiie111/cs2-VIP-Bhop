@@ -18,7 +18,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.4.0";
+    public override string ModuleVersion => "v2.5.0";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -83,9 +83,12 @@ public class Bhop : VipFeatureBase, IDisposable
     // Returns a pointer: it must be declared as IntPtr, a narrower type corrupts the result.
     private readonly MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, IntPtr>? _processUsercmds;
 
-    // Rebuilt every tick: MovementServices pointers and controller pointers of VIPs with active bhop
+    private readonly MemoryFunctionVoid<CCSPlayerPawnBase>? _postThink;
+
+    // Rebuilt every tick: MovementServices, controller and pawn pointers of VIPs with active bhop
     private readonly HashSet<IntPtr> _activeServices = new();
     private readonly HashSet<IntPtr> _activeControllers = new();
+    private readonly HashSet<IntPtr> _activePawns = new();
 
     // Real server values, captured every tick (the override never outlives a VIP's own processing)
     private bool _realAutoBhop;
@@ -93,6 +96,14 @@ public class Bhop : VipFeatureBase, IDisposable
 
     // Diagnostics (css_vipbhop_status)
     private readonly Dictionary<IntPtr, int> _controllerSlots = new();
+    private readonly Dictionary<IntPtr, int> _serviceSlots = new();
+    private readonly Dictionary<IntPtr, int> _pawnSlots = new();
+    private long _postThinkCalls;
+
+    // css_vipbhop_trace: order of hook calls over a few ticks
+    private int _traceTicksLeft;
+    private readonly List<string> _trace = new();
+    private System.Text.StringBuilder? _traceLine;
     private readonly long[] _simulateBySlot = new long[65];
     private readonly long[] _ticksBySlot = new long[65];
     private long _simulateCalls;
@@ -151,6 +162,19 @@ public class Bhop : VipFeatureBase, IDisposable
                 ProcessUsercmdsKey);
         }
 
+        // Pawn PostThink runs per player outside the command processing (signature maintained by CSS itself).
+        // Without it a VIP's "true" can reach other players there.
+        try
+        {
+            _postThink = VirtualFunctions.CCSPlayerPawnBase_PostThinkFunc;
+            _postThink.Hook(PostThinkPre, HookMode.Pre);
+        }
+        catch (Exception e)
+        {
+            _postThink = null;
+            plugin.Logger.LogWarning(e, "[VIP Bhop] CCSPlayerPawnBase_PostThink hook failed");
+        }
+
         _realAutoBhop = _autoBhop.GetPrimitiveValue<bool>();
         _realEnableBhop = _enableBhop.GetPrimitiveValue<bool>();
 
@@ -162,12 +186,19 @@ public class Bhop : VipFeatureBase, IDisposable
         plugin.RegisterListener<Listeners.OnClientConnected>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnClientDisconnectPost>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnTick>(OnTick);
-        plugin.RegisterListener<Listeners.OnServerPostEntityThink>(EnsureRealValues);
+        plugin.RegisterListener<Listeners.OnServerPreEntityThink>(() => Trace("PRE"));
+        plugin.RegisterListener<Listeners.OnServerPostEntityThink>(() =>
+        {
+            Trace("POST");
+            EnsureRealValues();
+        });
         plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
         plugin.AddCommand("css_vipbhop_status", "VIP Bhop diagnostics (server console or @css/root)", OnStatusCommand);
+        plugin.AddCommand("css_vipbhop_trace", "VIP Bhop: hook call order for 3 ticks (server console or @css/root)", OnTraceCommand);
 
-        plugin.Logger.LogInformation("[VIP Bhop] {0} loaded: OnSimulateUserCommands+ProcessMovement OK, ProcessUsercmds {1}",
-            plugin.ModuleVersion, _processUsercmds != null ? "OK" : "NOT FOUND");
+        plugin.Logger.LogInformation(
+            "[VIP Bhop] {0} loaded: OnSimulateUserCommands+ProcessMovement OK, ProcessUsercmds {1}, PostThink {2}",
+            plugin.ModuleVersion, _processUsercmds != null ? "OK" : "NOT FOUND", _postThink != null ? "OK" : "NOT FOUND");
     }
 
     private bool IsWorking => _processMovement != null;
@@ -204,9 +235,14 @@ public class Bhop : VipFeatureBase, IDisposable
 
     private void OnTick()
     {
+        if (_traceTicksLeft > 0) FlushTraceTick();
+
         _activeServices.Clear();
         _activeControllers.Clear();
+        _activePawns.Clear();
         _controllerSlots.Clear();
+        _serviceSlots.Clear();
+        _pawnSlots.Clear();
 
         _realAutoBhop = _autoBhop!.GetPrimitiveValue<bool>();
         _realEnableBhop = _enableBhop!.GetPrimitiveValue<bool>();
@@ -227,14 +263,16 @@ public class Bhop : VipFeatureBase, IDisposable
             // Per-client values: only sent when they change
             SyncClient(player, state, bhop || serverAutoBhop, bhop || serverEnableBhop);
 
-            if (!bhop || !player.PawnIsAlive) continue;
-
             var pawn = player.PlayerPawn.Value;
             var services = pawn?.MovementServices;
-            if (pawn == null || services == null) continue;
+            if (pawn != null) _pawnSlots[pawn.Handle] = player.Slot;
+            if (services != null) _serviceSlots[services.Handle] = player.Slot;
+
+            if (!bhop || !player.PawnIsAlive || pawn == null || services == null) continue;
 
             _activeServices.Add(services.Handle);
             _activeControllers.Add(player.Handle);
+            _activePawns.Add(pawn.Handle);
 
             if (state.MaxSpeed > 0)
                 ClampSpeed(player, pawn, state.MaxSpeed);
@@ -259,7 +297,18 @@ public class Bhop : VipFeatureBase, IDisposable
     private HookResult ProcessUsercmdsPre(DynamicHook hook)
     {
         _usercmdsCalls++;
-        ApplyFor(_activeControllers.Contains(hook.GetParam<IntPtr>(0)));
+        var controller = hook.GetParam<IntPtr>(0);
+        Trace("U", _controllerSlots, controller);
+        ApplyFor(_activeControllers.Contains(controller));
+        return HookResult.Continue;
+    }
+
+    private HookResult PostThinkPre(DynamicHook hook)
+    {
+        _postThinkCalls++;
+        var pawn = hook.GetParam<IntPtr>(0);
+        Trace("T", _pawnSlots, pawn);
+        ApplyFor(_activePawns.Contains(pawn));
         return HookResult.Continue;
     }
 
@@ -268,6 +317,7 @@ public class Bhop : VipFeatureBase, IDisposable
         _simulateCalls++;
         var controller = hook.GetParam<IntPtr>(0);
         if (_controllerSlots.TryGetValue(controller, out var slot)) _simulateBySlot[slot]++;
+        Trace("S", _controllerSlots, controller);
 
         ApplyFor(_activeControllers.Contains(controller));
         return HookResult.Continue;
@@ -276,7 +326,9 @@ public class Bhop : VipFeatureBase, IDisposable
     private HookResult ProcessMovementPre(DynamicHook hook)
     {
         _preCalls++;
-        ApplyFor(_activeServices.Contains(hook.GetParam<IntPtr>(0)));
+        var services = hook.GetParam<IntPtr>(0);
+        Trace("M", _serviceSlots, services);
+        ApplyFor(_activeServices.Contains(services));
         return HookResult.Continue;
     }
 
@@ -306,6 +358,51 @@ public class Bhop : VipFeatureBase, IDisposable
         enableBhop = _realEnableBhop;
     }
 
+    // Trace format per tick: PRE/POST = entity think phase, U = ProcessUsercmds, S = OnSimulateUserCommands,
+    // M = ProcessMovement, T = PostThink; then the player slot, "*" for an active VIP, and the value of
+    // sv_autobunnyhopping at entry ("+" true, "-" false). A non-VIP entry with "+" means it came in with a VIP's value.
+    private void Trace(string marker) => _traceLine?.Append(marker).Append(' ');
+
+    private void Trace(string marker, Dictionary<IntPtr, int> slots, IntPtr pointer)
+    {
+        if (_traceLine == null) return;
+
+        var slot = slots.TryGetValue(pointer, out var s) ? s.ToString() : "?";
+        var vip = _activeControllers.Count > 0 &&
+                  (marker == "U" || marker == "S" ? _activeControllers.Contains(pointer)
+                      : marker == "M" ? _activeServices.Contains(pointer)
+                      : _activePawns.Contains(pointer));
+        var value = _autoBhop!.GetPrimitiveValue<bool>() ? "+" : "-";
+        _traceLine.Append(marker).Append(slot).Append(vip ? "*" : "").Append(value).Append(' ');
+    }
+
+    private void FlushTraceTick()
+    {
+        if (_traceLine != null) _trace.Add(_traceLine.ToString());
+        _traceTicksLeft--;
+        if (_traceTicksLeft > 0)
+        {
+            _traceLine = new System.Text.StringBuilder();
+            return;
+        }
+
+        _traceLine = null;
+        Server.PrintToConsole("[VIP Bhop] trace (U=usercmds S=simulate M=movement T=postthink, *=VIP, +/-=autobhop at entry):");
+        for (var i = 1; i < _trace.Count; i++)
+            Server.PrintToConsole($"[VIP Bhop] tick {i}: {_trace[i]}");
+        _trace.Clear();
+    }
+
+    private void OnTraceCommand(CCSPlayerController? caller, CommandInfo info)
+    {
+        if (caller != null && !AdminManager.PlayerHasPermissions(caller, "@css/root")) return;
+
+        _trace.Clear();
+        _traceLine = new System.Text.StringBuilder();
+        _traceTicksLeft = 4; // first (partial) tick is dropped
+        info.ReplyToCommand("[VIP Bhop] tracing 3 ticks, result goes to the server console");
+    }
+
     private void OnStatusCommand(CCSPlayerController? caller, CommandInfo info)
     {
         // server console / rcon, or a root admin from the client console
@@ -318,9 +415,10 @@ public class Bhop : VipFeatureBase, IDisposable
         info.ReplyToCommand(
             $"[VIP Bhop] flags: {AutoBhopName}={_autoBhop?.Flags} {EnableBhopName}={_enableBhop?.Flags}");
         info.ReplyToCommand(
-            $"[VIP Bhop] {_plugin.ModuleVersion}, ProcessUsercmds hook: {(_processUsercmds != null ? "OK" : "NOT FOUND")}");
+            $"[VIP Bhop] {_plugin.ModuleVersion}, ProcessUsercmds hook: {(_processUsercmds != null ? "OK" : "NOT FOUND")}, " +
+            $"PostThink hook: {(_postThink != null ? "OK" : "NOT FOUND")}");
         info.ReplyToCommand(
-            $"[VIP Bhop] usercmds={_usercmdsCalls} simulate={_simulateCalls} processMovement={_preCalls} vip={_vipCalls} restores={_staleRestores}");
+            $"[VIP Bhop] usercmds={_usercmdsCalls} simulate={_simulateCalls} processMovement={_preCalls} postThink={_postThinkCalls} vip={_vipCalls} restores={_staleRestores}");
 
         foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
         {
@@ -398,6 +496,7 @@ public class Bhop : VipFeatureBase, IDisposable
     {
         if (_processMovement == null) return;
 
+        _postThink?.Unhook(PostThinkPre, HookMode.Pre);
         _processUsercmds?.Unhook(ProcessUsercmdsPre, HookMode.Pre);
         _simulateUserCommands?.Unhook(SimulateUserCommandsPre, HookMode.Pre);
         _processMovement.Unhook(ProcessMovementPre, HookMode.Pre);
