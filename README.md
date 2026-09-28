@@ -116,7 +116,7 @@ dotnet build VIP_Bhop.csproj -c Release
 **How it works** (same technique as the cs2kz-metamod autobhop style):
 - `FCVAR_REPLICATED` is removed from `sv_autobunnyhopping` and `sv_enablebunnyhopping`, so the server never broadcasts them.
 - Each client receives its own value through a single-recipient `CNETMsg_SetConVar`: `true` for an active VIP, the real server value for everyone else.
-- `CBasePlayerController::OnSimulateUserCommands` (before `SetupMove`) and `CCSPlayer_MovementServices::ProcessMovement` are hooked. At both points every player gets their own value written straight into memory: `true` for an active VIP, the real value for everyone else.
+- `CBasePlayerController::OnSimulateUserCommands` is hooked; it runs all of a player's command processing (`SetupMove`, `ProcessMovement`, ...). `ProcessMovement` is hooked as a second guard.
 - For a VIP the hook sets `true`, calls the original itself (bypassing the hook), restores the previous value and skips the original, so `true` exists only while that VIP's own commands run. No post hook is needed (it does not fire on CSS 1.0.375+).
 
 **Install:**
