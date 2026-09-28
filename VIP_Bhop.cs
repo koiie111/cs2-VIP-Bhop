@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Capabilities;
@@ -18,7 +20,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.6.0";
+    public override string ModuleVersion => "v2.6.1";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -56,7 +58,7 @@ public class VIP_Bhop : BasePlugin
  *     does not rely on post hooks (they do not fire there).
  * Client prediction and server movement agree -> native bhop without sticking or jitter.
  */
-public class Bhop : VipFeatureBase, IDisposable
+public unsafe class Bhop : VipFeatureBase, IDisposable
 {
     public override string Feature => "Bhop";
 
@@ -95,6 +97,11 @@ public class Bhop : VipFeatureBase, IDisposable
     private readonly HashSet<IntPtr> _activeControllers = new();
     private readonly HashSet<IntPtr> _activePawns = new();
 
+    // Cached addresses of the cvar values: GetPrimitiveValue costs two native calls, and the hooks below run
+    // several times per player per tick. Refreshed every tick and on map start.
+    private bool* _autoBhopValue;
+    private bool* _enableBhopValue;
+
     // Real server values, captured every tick (the override never outlives a VIP's own processing)
     private bool _realAutoBhop;
     private bool _realEnableBhop;
@@ -117,6 +124,7 @@ public class Bhop : VipFeatureBase, IDisposable
     private long _setupMoveCalls;
     private long _vipCalls;
     private long _staleRestores;
+    private long _hookTime; // Stopwatch ticks spent inside the hook handlers
 
     public Bhop(VIP_Bhop plugin, IVipCoreApi api) : base(api)
     {
@@ -185,8 +193,9 @@ public class Bhop : VipFeatureBase, IDisposable
             plugin.Logger.LogWarning(e, "[VIP Bhop] CCSPlayerPawnBase_PostThink hook failed");
         }
 
-        _realAutoBhop = _autoBhop.GetPrimitiveValue<bool>();
-        _realEnableBhop = _enableBhop.GetPrimitiveValue<bool>();
+        RefreshCvarPointers();
+        _realAutoBhop = *_autoBhopValue;
+        _realEnableBhop = *_enableBhopValue;
 
         _autoBhopFlags = _autoBhop.Flags;
         _enableBhopFlags = _enableBhop.Flags;
@@ -196,6 +205,7 @@ public class Bhop : VipFeatureBase, IDisposable
         plugin.RegisterListener<Listeners.OnClientConnected>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnClientDisconnectPost>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnTick>(OnTick);
+        plugin.RegisterListener<Listeners.OnMapStart>(_ => RefreshCvarPointers());
         plugin.RegisterListener<Listeners.OnServerPreEntityThink>(() => Trace("PRE"));
         plugin.RegisterListener<Listeners.OnServerPostEntityThink>(() =>
         {
@@ -212,6 +222,12 @@ public class Bhop : VipFeatureBase, IDisposable
     }
 
     private bool IsWorking => _processMovement != null;
+
+    private void RefreshCvarPointers()
+    {
+        _autoBhopValue = (bool*)Unsafe.AsPointer(ref _autoBhop!.GetPrimitiveValue<bool>());
+        _enableBhopValue = (bool*)Unsafe.AsPointer(ref _enableBhop!.GetPrimitiveValue<bool>());
+    }
 
     public override void OnPlayerLoaded(CCSPlayerController player, string group)
     {
@@ -254,8 +270,10 @@ public class Bhop : VipFeatureBase, IDisposable
         _serviceSlots.Clear();
         _pawnSlots.Clear();
 
-        _realAutoBhop = _autoBhop!.GetPrimitiveValue<bool>();
-        _realEnableBhop = _enableBhop!.GetPrimitiveValue<bool>();
+        // Cheap (4 native calls per tick) and guarantees the hooks never write to a stale address
+        RefreshCvarPointers();
+        _realAutoBhop = *_autoBhopValue;
+        _realEnableBhop = *_enableBhopValue;
         var serverAutoBhop = _realAutoBhop;
         var serverEnableBhop = _realEnableBhop;
 
@@ -306,48 +324,58 @@ public class Bhop : VipFeatureBase, IDisposable
 
     private HookResult ProcessUsercmdsPre(DynamicHook hook)
     {
+        var start = Stopwatch.GetTimestamp();
         _usercmdsCalls++;
         var controller = hook.GetParam<IntPtr>(0);
         Trace("U", _controllerSlots, controller);
         ApplyFor(_activeControllers.Contains(controller));
+        _hookTime += Stopwatch.GetTimestamp() - start;
         return HookResult.Continue;
     }
 
     private HookResult PostThinkPre(DynamicHook hook)
     {
+        var start = Stopwatch.GetTimestamp();
         _postThinkCalls++;
         var pawn = hook.GetParam<IntPtr>(0);
         Trace("T", _pawnSlots, pawn);
         ApplyFor(_activePawns.Contains(pawn));
+        _hookTime += Stopwatch.GetTimestamp() - start;
         return HookResult.Continue;
     }
 
     private HookResult SimulateUserCommandsPre(DynamicHook hook)
     {
+        var start = Stopwatch.GetTimestamp();
         _simulateCalls++;
         var controller = hook.GetParam<IntPtr>(0);
         if (_controllerSlots.TryGetValue(controller, out var slot)) _simulateBySlot[slot]++;
         Trace("S", _controllerSlots, controller);
 
         ApplyFor(_activeControllers.Contains(controller));
+        _hookTime += Stopwatch.GetTimestamp() - start;
         return HookResult.Continue;
     }
 
     private HookResult SetupMovePre(DynamicHook hook)
     {
+        var start = Stopwatch.GetTimestamp();
         _setupMoveCalls++;
         var services = hook.GetParam<IntPtr>(0);
         Trace("P", _serviceSlots, services);
         ApplyFor(_activeServices.Contains(services));
+        _hookTime += Stopwatch.GetTimestamp() - start;
         return HookResult.Continue;
     }
 
     private HookResult ProcessMovementPre(DynamicHook hook)
     {
+        var start = Stopwatch.GetTimestamp();
         _preCalls++;
         var services = hook.GetParam<IntPtr>(0);
         Trace("M", _serviceSlots, services);
         ApplyFor(_activeServices.Contains(services));
+        _hookTime += Stopwatch.GetTimestamp() - start;
         return HookResult.Continue;
     }
 
@@ -361,20 +389,18 @@ public class Bhop : VipFeatureBase, IDisposable
         }
 
         _vipCalls++;
-        _autoBhop!.GetPrimitiveValue<bool>() = true;
-        _enableBhop!.GetPrimitiveValue<bool>() = true;
+        *_autoBhopValue = true;
+        *_enableBhopValue = true;
     }
 
     // Called at every non-VIP entry point: nobody but a VIP may ever run with a value other than the real one
     private void EnsureRealValues()
     {
-        ref var autoBhop = ref _autoBhop!.GetPrimitiveValue<bool>();
-        ref var enableBhop = ref _enableBhop!.GetPrimitiveValue<bool>();
-        if (autoBhop == _realAutoBhop && enableBhop == _realEnableBhop) return;
+        if (*_autoBhopValue == _realAutoBhop && *_enableBhopValue == _realEnableBhop) return;
 
         _staleRestores++;
-        autoBhop = _realAutoBhop;
-        enableBhop = _realEnableBhop;
+        *_autoBhopValue = _realAutoBhop;
+        *_enableBhopValue = _realEnableBhop;
     }
 
     // Trace format per tick: PRE/POST = entity think phase, U = ProcessUsercmds, S = OnSimulateUserCommands,
@@ -391,7 +417,7 @@ public class Bhop : VipFeatureBase, IDisposable
                   (marker == "U" || marker == "S" ? _activeControllers.Contains(pointer)
                       : marker == "M" || marker == "P" ? _activeServices.Contains(pointer)
                       : _activePawns.Contains(pointer));
-        var value = _autoBhop!.GetPrimitiveValue<bool>() ? "+" : "-";
+        var value = *_autoBhopValue ? "+" : "-";
         _traceLine.Append(marker).Append(slot).Append(vip ? "*" : "").Append(value).Append(' ');
     }
 
@@ -422,6 +448,16 @@ public class Bhop : VipFeatureBase, IDisposable
         info.ReplyToCommand("[VIP Bhop] tracing 3 ticks, result goes to the server console");
     }
 
+    private string HookTimeReport()
+    {
+        var calls = _usercmdsCalls + _simulateCalls + _setupMoveCalls + _preCalls + _postThinkCalls;
+        if (calls == 0) return "no calls yet";
+
+        var totalMs = _hookTime * 1000.0 / Stopwatch.Frequency;
+        return $"{totalMs:0.0} ms total, {totalMs * 1000.0 / calls:0.00} us per call ({calls} calls; " +
+               "CSS native-to-managed dispatch not included)";
+    }
+
     private void OnStatusCommand(CCSPlayerController? caller, CommandInfo info)
     {
         // server console / rcon, or a root admin from the client console
@@ -436,6 +472,8 @@ public class Bhop : VipFeatureBase, IDisposable
         info.ReplyToCommand(
             $"[VIP Bhop] {_plugin.ModuleVersion}, ProcessUsercmds hook: {(_processUsercmds != null ? "OK" : "NOT FOUND")}, " +
             $"PostThink hook: {(_postThink != null ? "OK" : "NOT FOUND")}");
+        info.ReplyToCommand(
+            $"[VIP Bhop] handler time: {HookTimeReport()}");
         info.ReplyToCommand(
             $"[VIP Bhop] usercmds={_usercmdsCalls} simulate={_simulateCalls} setupMove={_setupMoveCalls} processMovement={_preCalls} postThink={_postThinkCalls} vip={_vipCalls} restores={_staleRestores}");
 
