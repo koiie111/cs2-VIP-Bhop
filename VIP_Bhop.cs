@@ -17,7 +17,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.0.1";
+    public override string ModuleVersion => "v2.0.2";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -125,6 +125,12 @@ public class Bhop : VipFeatureBase, IDisposable
         plugin.RegisterListener<Listeners.OnClientConnected>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnClientDisconnectPost>(slot => ResetState(slot));
         plugin.RegisterListener<Listeners.OnTick>(OnTick);
+        // Player movement runs inside the entity think phase. Restore right after it, because the
+        // ProcessMovement post hook is not guaranteed to fire (it does not on CSS 1.0.375+/KHook).
+        plugin.RegisterListener<Listeners.OnServerPostEntityThink>(() =>
+        {
+            if (_overridden) Restore();
+        });
         plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
         plugin.AddCommand("css_vipbhop_status", "VIP Bhop diagnostics", OnStatusCommand);
     }
@@ -263,7 +269,8 @@ public class Bhop : VipFeatureBase, IDisposable
         info.ReplyToCommand(
             $"[VIP Bhop] flags: {AutoBhopName}={_autoBhop?.Flags} {EnableBhopName}={_enableBhop?.Flags}");
         info.ReplyToCommand(
-            $"[VIP Bhop] ProcessMovement pre={_preCalls} post={_postCalls} vip={_vipCalls} staleRestores={_staleRestores}");
+            $"[VIP Bhop] ProcessMovement pre={_preCalls} post={_postCalls} vip={_vipCalls} staleRestores={_staleRestores}" +
+            (_postCalls == 0 && _preCalls > 0 ? " (post hook not firing, fallback restore in use)" : ""));
 
         foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
         {
