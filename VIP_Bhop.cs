@@ -18,7 +18,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.3.0";
+    public override string ModuleVersion => "v2.3.1";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -78,8 +78,9 @@ public class Bhop : VipFeatureBase, IDisposable
     private readonly MemoryFunctionVoid<IntPtr, IntPtr>? _processMovement;
     private readonly MemoryFunctionVoid<IntPtr>? _simulateUserCommands;
 
-    // int CCSPlayerController::ProcessUsercmds(CUserCmd* cmds, int numcmds, bool paused, float margin)
-    private readonly MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, int>? _processUsercmds;
+    // void* CCSPlayerController::ProcessUsercmds(CUserCmd* cmds, int numcmds, bool paused, float margin)
+    // Returns a pointer: it must be declared as IntPtr, a narrower type corrupts the result.
+    private readonly MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, IntPtr>? _processUsercmds;
 
     // Rebuilt every tick: MovementServices pointers and controller pointers of VIPs with active bhop
     private readonly HashSet<IntPtr> _activeServices = new();
@@ -135,13 +136,14 @@ public class Bhop : VipFeatureBase, IDisposable
             return;
         }
 
-        // Part of the jump handling runs when the client's commands are received, outside
-        // OnSimulateUserCommands. Without this hook the VIP sticks to the ground now and then.
-        // Optional: the wrapper cannot leak, so the module still works (with some sticking) without it.
+        // Part of the jump handling runs in ProcessUsercmds around OnSimulateUserCommands. Without this
+        // hook the VIP sticks to the ground now and then. The hook only reads the controller pointer and
+        // lets the game call the original itself (never invoked from here).
+        // Optional: without it the module still works, with some sticking.
         try
         {
             _processUsercmds =
-                new MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, int>(
+                new MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, IntPtr>(
                     GameData.GetSignature(ProcessUsercmdsKey));
             _processUsercmds.Hook(ProcessUsercmdsPre, HookMode.Pre);
         }
@@ -281,19 +283,17 @@ public class Bhop : VipFeatureBase, IDisposable
 
         if (_activeControllers.Count == 0 || !_activeControllers.Contains(controller))
         {
+            // Entry point of every player's command processing: a VIP's "true" ends here at the latest
             EnsureRealValues();
             return HookResult.Continue;
         }
 
-        var cmds = hook.GetParam<IntPtr>(1);
-        var numCmds = hook.GetParam<int>(2);
-        var paused = hook.GetParam<bool>(3);
-        var margin = hook.GetParam<float>(4);
-
-        var result = 0;
-        RunWithBhop(() => result = _processUsercmds!.Invoke(controller, cmds, numCmds, paused, margin, true));
-        hook.SetReturn(result);
-        return HookResult.Handled;
+        // VIP: "true" for this VIP's whole ProcessUsercmds. It is reset at the next player's entry point
+        // (ProcessUsercmds / OnSimulateUserCommands / ProcessMovement), after the entity think phase and every tick.
+        _vipCalls++;
+        _autoBhop!.GetPrimitiveValue<bool>() = true;
+        _enableBhop!.GetPrimitiveValue<bool>() = true;
+        return HookResult.Continue;
     }
 
     private HookResult ProcessMovementPre(DynamicHook hook)
@@ -337,7 +337,7 @@ public class Bhop : VipFeatureBase, IDisposable
         }
     }
 
-    // Guard: nobody but a VIP inside RunWithBhop may ever see a value other than the real one
+    // Called at every non-VIP entry point: nobody but a VIP may ever run with a value other than the real one
     private void EnsureRealValues()
     {
         ref var autoBhop = ref _autoBhop!.GetPrimitiveValue<bool>();
@@ -363,7 +363,7 @@ public class Bhop : VipFeatureBase, IDisposable
         info.ReplyToCommand(
             $"[VIP Bhop] {_plugin.ModuleVersion}, ProcessUsercmds hook: {(_processUsercmds != null ? "OK" : "NOT FOUND")}");
         info.ReplyToCommand(
-            $"[VIP Bhop] usercmds={_usercmdsCalls} simulate={_simulateCalls} processMovement={_preCalls} vipWrapped={_vipCalls} staleRestores={_staleRestores} (must stay 0)");
+            $"[VIP Bhop] usercmds={_usercmdsCalls} simulate={_simulateCalls} processMovement={_preCalls} vipWrapped={_vipCalls} restores={_staleRestores}");
 
         foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
         {
