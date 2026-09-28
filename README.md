@@ -1,51 +1,57 @@
-# [VIP] Bhop: native cvars
+<div align="center">
 
-Модуль для [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) (CounterStrikeSharp): автобхоп **только для VIP-игроков** на встроенных переменных CS2 `sv_autobunnyhopping` / `sv_enablebunnyhopping`. Прыжки идут без прилипаний и дёрганий, у остальных игроков движение ванильное.
+# [VIP] Bhop
 
-A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStrikeSharp: **VIP-only** auto bunnyhop driven by CS2's own `sv_autobunnyhopping` / `sv_enablebunnyhopping`, with no sticking or jitter. Everyone else keeps vanilla movement. English section is [below](#english).
+**Автобхоп только для VIP на встроенных переменных CS2, без прилипаний и утечки на остальных игроков**
 
-> Проверено на сервере с CounterStrikeSharp 1.0.376 / CS2 1.41.8.x (обновление 23.09.2026), версии v2.6.0–v2.6.1: у VIP бхоп без прилипаний и телепортов, у обычных игроков движение ванильное (проверено через `css_vipbhop_trace`).
+Модуль для [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) · CounterStrikeSharp
+
+[![Release](https://img.shields.io/github/v/release/koiie111/cs2-VIP-Bhop?label=release)](https://github.com/koiie111/cs2-VIP-Bhop/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/koiie111/cs2-VIP-Bhop/build.yml?label=build)](https://github.com/koiie111/cs2-VIP-Bhop/actions/workflows/build.yml)
+[![CounterStrikeSharp](https://img.shields.io/badge/CounterStrikeSharp-%E2%89%A5%201.0.375-blue)](https://github.com/roflmuffin/CounterStrikeSharp)
+[![License](https://img.shields.io/github/license/koiie111/cs2-VIP-Bhop)](LICENSE)
+
+**Русский** · [English](README.en.md)
+
+</div>
 
 ---
 
-## Зачем это нужно
+VIP-игрок прыгает на родном автобхопе CS2 (`sv_autobunnyhopping` + `sv_enablebunnyhopping`). Клиент и сервер считают его движение одинаково, поэтому бхоп идёт без прилипаний и рывков. Остальные игроки двигаются как на ванильном сервере: переменные для них не меняются ни на сервере, ни у клиента.
 
-Оригинальный модуль `VIP_Bhop` делает бхоп так: подкидывает игрока (`AbsVelocity.Z = 300`) на сервере и каждый тик отправляет клиенту `sv_autobunnyhopping true`. Из-за этого возникают две проблемы:
+Модуль заменяет оригинальный `VIP_Bhop` без переделки конфигов: у него то же имя фичи и те же настройки групп.
 
-- **Рассинхрон.** Клиент прыгает по встроенному автобхопу, а сервер считает движение с `false`. Отсюда прилипания к земле и дёрганья.
-- **Утечка на всех.** Если `ReplicateConVar` ведёт себя неправильно (например, после обновления CS2, пока CSS не обновлён), значение `true` может уйти всем клиентам.
+|  | Оригинальный `VIP_Bhop` | Этот модуль |
+|---|---|---|
+| Как прыгает VIP | Сервер подкидывает игрока вручную | Родной автобхоп CS2 |
+| Прилипания к земле | Есть: клиент и сервер считают по-разному | Нет |
+| Бхоп у игроков без VIP | Возможен после обновлений CS2 | Нет, проверено по порядку вызовов |
+| Потолок скорости | Ванильный при приземлении, плюс `MaxSpeed` | Ванильного нет (`sv_enablebunnyhopping`), только `MaxSpeed` |
 
-## Как работает
+> Проверено на CS2 1.41.8.x (обновление от 23.09.2026) с CounterStrikeSharp 1.0.376.
 
-Тот же приём, что у стиля autobhop в [cs2kz-metamod](https://github.com/KZGlobalTeam/cs2kz-metamod):
+## Быстрый старт
 
-1. С `sv_autobunnyhopping` и `sv_enablebunnyhopping` снимается флаг `FCVAR_REPLICATED`, и сервер больше не рассылает их всем.
-2. Каждому клиенту значение отправляется отдельно (`CNETMsg_SetConVar` одному получателю) и только при изменении: VIP с активным бхопом получает `true`, остальные — реальное значение сервера.
-3. Перехватываются точки входа в обработку каждого игрока: `CCSPlayerController::ProcessUsercmds` → внутри неё `CBasePlayerController::OnSimulateUserCommands` → `CCSPlayer_MovementServices::SetupMove` → `CCSPlayer_MovementServices::ProcessMovement`, а также `CCSPlayerPawnBase::PostThink` пешки (сигнатуру поддерживает сам CSS). На входе в каждую для **каждого** игрока в память пишется его значение: VIP получает `true`, остальные — реальное значение сервера. Колбэки изменения не вызываются, рассылки нет.
-4. Хуки только меняют значение переменной: плагин никогда сам не вызывает и не пропускает функции игры. На CSS 1.0.375+ (KHook) такой приём приводил к повторной обработке команд VIP (сверхскорость, телепорты, падение сервера). Post-хуки тоже не используются, там они не срабатывают.
-5. Значение VIP сбрасывается на входе следующего игрока, после фазы обработки сущностей и каждый тик.
+**Нужно:** [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp) версии 1.0.375 или новее (.NET 10) и [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore).
 
-В итоге клиент и сервер считают движение VIP одинаково по встроенному автобхопу CS2.
-
-## Требования
-
-- [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp) **>= 1.0.375** (.NET 10)
-- [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore)
-
-## Установка
-
-1. Скачайте `VIP_Bhop.zip` из [Releases](../../releases) или соберите сами (см. ниже).
-2. **Удалите оригинальный** `addons/counterstrikesharp/plugins/VIP_Bhop/`. Фича называется так же (`Bhop`), вместе они работать не могут.
-3. Распакуйте архив в `game/csgo/`:
+1. Скачайте `VIP_Bhop.zip` из [последнего релиза](https://github.com/koiie111/cs2-VIP-Bhop/releases/latest).
+2. Удалите оригинальный модуль: `addons/counterstrikesharp/plugins/VIP_Bhop/`.
+3. Распакуйте архив в `game/csgo/`. Появятся два файла:
    ```
    addons/counterstrikesharp/plugins/VIP_Bhop/VIP_Bhop.dll
    addons/counterstrikesharp/gamedata/vip_bhop.json
    ```
-4. **Перезапустите сервер.** CSS читает gamedata только при старте.
+4. Перезапустите сервер. Gamedata читается только при старте CSS, `css_plugins reload` её не подхватит.
 
-## Настройка групп VIP Core
+Если модуль загрузился правильно, в логе сервера будет строка:
 
-Формат тот же, что у оригинального модуля (`addons/counterstrikesharp/configs/plugins/VIPCore/vip.json`):
+```
+[VIP Bhop] v2.6.1 loaded: OnSimulateUserCommands+SetupMove+ProcessMovement OK, ProcessUsercmds OK, PostThink OK
+```
+
+## Настройка
+
+Бхоп выдаётся группам в конфиге VIP Core, `addons/counterstrikesharp/configs/plugins/VIPCore/vip.json`:
 
 ```json
 "Bhop": {
@@ -54,103 +60,155 @@ A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStri
 }
 ```
 
-| Параметр | Описание |
+| Параметр | Что делает |
 |---|---|
-| `Timer` | Через сколько секунд после окончания freezetime включается бхоп. В разминке бхоп включается сразу. |
-| `MaxSpeed` | Ограничение горизонтальной скорости при прыжке. `0` = без ограничения. Ограничение делается на сервере, поэтому при срабатывании возможен небольшой рывок. Для максимально плавного бхопа ставьте `0`. |
+| `Timer` | Через сколько секунд после конца freezetime включается бхоп. В разминке включается сразу. |
+| `MaxSpeed` | Потолок горизонтальной скорости при прыжке. `0` — без ограничения, это самый плавный вариант. Потолок срабатывает на сервере, поэтому при его срабатывании возможен небольшой рывок. |
 
-Тексты сообщений (`bhop.TimeToActivation`, `bhop.Activated`) берутся из языковых файлов VIP Core.
+Игрок включает и выключает бхоп в VIP-меню. Сообщения `bhop.TimeToActivation` и `bhop.Activated` берутся из языковых файлов VIP Core.
 
-## Gamedata / сигнатуры
+## Как это работает
 
-Сигнатуры хранятся в отдельном файле [`gamedata/vip_bhop.json`](gamedata/vip_bhop.json):
+В CS2 переменная `sv_autobunnyhopping` одна на весь сервер. Модуль подменяет её значение точечно: пока игра обрабатывает движение VIP, там `true`, пока обрабатывает остальных — реальное значение сервера.
 
-| Ключ | Функция в [cs2-signatures](https://github.com/ianlucas/cs2-signatures) |
-|---|---|
-| `VIP_Bhop_CBasePlayerController_OnSimulateUserCommands` | SwiftlyS2 → `CBasePlayerController::OnSimulateUserCommands` (у cs2kz называется `PhysicsSimulate`) |
-| `VIP_Bhop_CCSPlayerController_ProcessUsercmds` | CS2Fixes / cs2kz-metamod → `ProcessUsercmds` |
-| `VIP_Bhop_CCSPlayer_MovementServices_SetupMove` | SwiftlyS2 → `CCSPlayer_MovementServices::SetupMove` (cs2kz → `SetupMove`) |
-| `VIP_Bhop_CCSPlayer_MovementServices_ProcessMovement` | CS2Fixes / SwiftlyS2 → `ProcessMovement` |
+```mermaid
+flowchart LR
+    A[Команды игрока] --> B{VIP с бхопом?}
+    B -- да --> C["sv_autobunnyhopping = true"]
+    B -- нет --> D["реальное значение сервера"]
+    C --> E[Движение игрока]
+    D --> E
+```
 
-- CSS при старте загружает все `*.json` из папки gamedata. Автообновление CSS перезаписывает только свой `gamedata.json`, так что этот файл не затрётся.
-- Ключ уникальный, чтобы устаревшая запись с тем же именем от другого плагина его не перекрыла.
-- После обновлений CS2 берите значения из колонки IDA-Style и перезапускайте сервер.
-- `OnSimulateUserCommands`, `SetupMove` и `ProcessMovement` обязательны. Если хотя бы одна из них не найдена, плагин пишет ошибку в лог и **ничего не меняет**: переменные остаются как на ванильном сервере.
-- `ProcessUsercmds` необязательна, но без неё `true` от VIP может достаться игроку, который обрабатывается сразу после него. В логе будет предупреждение.
-- `PostThink` берётся из gamedata самого CSS, отдельный ключ не нужен.
-- При загрузке в лог пишется строка `[VIP Bhop] vX loaded: ... ProcessUsercmds OK/NOT FOUND`.
+Клиенту VIP отдельно отправляется `true`, чтобы его предсказание движения совпадало с сервером. Остальным отправляется реальное значение. Общая рассылка этих переменных всем клиентам отключена.
+
+<details>
+<summary><b>Технические подробности</b></summary>
+
+<br>
+
+- С обеих переменных снимается флаг `FCVAR_REPLICATED`. Каждый клиент получает своё значение через `CNETMsg_SetConVar` с одним получателем, и только когда значение меняется.
+- Значение пишется в память напрямую, без колбэков изменения и без рассылки. Это делается на входе в каждую функцию, где игра обрабатывает конкретного игрока:
+
+  | Функция | Когда вызывается |
+  |---|---|
+  | `CCSPlayerController::ProcessUsercmds` | Сервер принимает команды от клиента |
+  | `CCSPlayer_MovementServices::SetupMove` | Подготовка движения, здесь переменные уже читаются |
+  | `CCSPlayer_MovementServices::ProcessMovement` | Само движение |
+  | `CCSPlayerPawnBase::PostThink` | Обработка пешки после движения |
+  | `CBasePlayerController::OnSimulateUserCommands` | Завершение симуляции команд |
+
+- Хуки только выставляют значение. Модуль никогда сам не вызывает и не пропускает функции игры: на CSS 1.0.375+ (KHook) это приводило к повторной обработке команд VIP, то есть к сверхскорости, телепортам и падению сервера. Post-хуки не используются, на этой версии CSS они не срабатывают.
+- Значение VIP сбрасывается при входе следующего игрока, после фазы обработки сущностей и в начале каждого тика.
+- Тот же принцип использует стиль autobhop в [cs2kz-metamod](https://github.com/KZGlobalTeam/cs2kz-metamod).
+
+</details>
+
+## После обновлений CS2
+
+Адреса функций ищутся по сигнатурам. Они лежат в отдельном файле `gamedata/vip_bhop.json`, поэтому их можно обновить без пересборки плагина. Автообновление CSS перезаписывает только свой `gamedata.json`, этот файл оно не трогает.
+
+Если после патча CS2 в логе появилась ошибка про сигнатуру:
+
+1. Найдите функцию в [ianlucas/cs2-signatures](https://github.com/ianlucas/cs2-signatures) и скопируйте значение из колонки **IDA-Style**.
+2. Вставьте его в `vip_bhop.json` для своей платформы (`windows` или `linux`).
+3. Перезапустите сервер.
+
+| Ключ в `vip_bhop.json` | Где искать в трекере | Обязательна |
+|---|---|:---:|
+| `VIP_Bhop_CCSPlayer_MovementServices_SetupMove` | SwiftlyS2 → `CCSPlayer_MovementServices::SetupMove` | ✅ |
+| `VIP_Bhop_CCSPlayer_MovementServices_ProcessMovement` | CS2Fixes / SwiftlyS2 → `ProcessMovement` | ✅ |
+| `VIP_Bhop_CBasePlayerController_OnSimulateUserCommands` | SwiftlyS2 → `CBasePlayerController::OnSimulateUserCommands` | ✅ |
+| `VIP_Bhop_CCSPlayerController_ProcessUsercmds` | CS2Fixes / cs2kz-metamod → `ProcessUsercmds` | — |
+
+Если не найдена хотя бы одна обязательная сигнатура, модуль ничего не меняет: переменные остаются как на ванильном сервере, и утечки бхопа не будет. Сигнатура `PostThink` берётся из gamedata самого CSS и обновляется вместе с ним.
 
 ## Диагностика
 
-Команда `css_vipbhop_status` работает из консоли сервера, через rcon, а также из консоли клиента для админов с `@css/root`. В консоли клиента CS2 сначала пишет `Unknown command`, но команда всё равно уходит на сервер, и ответ появляется ниже.
+Обе команды работают из консоли сервера, через rcon и из консоли игры для админов с флагом `@css/root`.
+
+| Команда | Что показывает |
+|---|---|
+| `css_vipbhop_status` | Состояние хуков, значения переменных, счётчики вызовов, время работы и состояние каждого игрока |
+| `css_vipbhop_trace` | Порядок вызовов за 3 тика: какая функция, для какого игрока и с каким значением на входе |
+
+> В консоли игры CS2 сначала выводит `Unknown command`. Это нормально: команда всё равно уходит на сервер, ответ появится следом.
+
+<details>
+<summary><b>Как читать <code>css_vipbhop_status</code></b></summary>
+
+<br>
 
 ```
 [VIP Bhop] hook: OK
-[VIP Bhop] real values: sv_autobunnyhopping=False sv_enablebunnyhopping=False, overridden now: False
-[VIP Bhop] flags: ...
-[VIP Bhop] v2.4.0, ProcessUsercmds hook: OK
-[VIP Bhop] usercmds=40000 simulate=40100 processMovement=40300 vip=60000 restores=12000
-[VIP Bhop] #0 Player: enabled=True active=True sent=True/True inMovementSet=True inControllerSet=True simulate/tick=1.00
+[VIP Bhop] real values: sv_autobunnyhopping=False sv_enablebunnyhopping=False, current: False/False
+[VIP Bhop] v2.6.1, ProcessUsercmds hook: OK, PostThink hook: OK
+[VIP Bhop] handler time: 159.0 ms total, 2.74 us per call (58002 calls; CSS native-to-managed dispatch not included)
+[VIP Bhop] usercmds=11515 simulate=11639 setupMove=11032 processMovement=12784 postThink=11032 vip=17845 restores=5466
+[VIP Bhop] #0 koiie: enabled=True active=True sent=True/True inMovementSet=True inControllerSet=True simulate/tick=1.00
+[VIP Bhop] #1 Malw: enabled=False active=False sent=False/False inMovementSet=False inControllerSet=False simulate/tick=1.00
 ```
 
-- `real values` должны совпадать с вашим `server.cfg`. Если там `True`, переменную включает конфиг или другой плагин, а не этот модуль. Проверьте так: `css_plugins unload VIP_Bhop`, затем `sv_autobunnyhopping`.
-- `usercmds`, `simulate` и `processMovement` должны быть **примерно равны**. Если `processMovement` заметно больше `simulate`, команды кого-то обрабатываются повторно: создайте issue и приложите вывод команды.
-- `restores` — сколько раз на входе обычного игрока значение VIP было сброшено до реального. Рост — это нормально.
-- `simulate/tick` у каждого игрока должен быть около `1.00`. Если у кого-то заметно меньше, часть его команд обрабатывается вне игрового потока, где CSS не вызывает хуки плагинов. Тогда подмена переменной для этого игрока ненадёжна. Создайте issue и приложите вывод команды.
-- У обычных игроков должно быть `enabled=False sent=False/False inMovementSet=False inControllerSet=False`.
-- Если обычный игрок всё равно распрыгивается с зажатым пробелом, выполните `sv_autobunnyhopping` **в консоли его клиента**. Если там `true`, значение утекает к клиенту по сети (например, из-за устаревшего CSS). Если `false`, проблема на стороне сервера.
+- **`real values`** должно совпадать с вашим `server.cfg`, обычно это `False`.
+- **Счётчики вызовов** должны быть примерно равны между собой. Если `processMovement` намного больше `simulate`, команды обрабатываются повторно, и это ошибка.
+- **`restores`** — сколько раз значение VIP сбрасывалось перед другим игроком. Рост — это нормально.
+- **`simulate/tick`** у каждого игрока должен быть около `1.00`.
+- **У игрока без VIP** везде должно быть `False`.
 
-Если обычный игрок распрыгивается при активном VIP, выполните `css_vipbhop_trace`, пока оба прыгают. В консоль сервера выведется порядок вызовов за 3 тика: `U` = ProcessUsercmds, `S` = OnSimulateUserCommands, `P` = SetupMove, `M` = ProcessMovement, `T` = PostThink, затем слот игрока, `*` у VIP и значение `sv_autobunnyhopping` на входе (`+`/`-`). `PRE`/`POST` — начало и конец фазы обработки сущностей. Приложите вывод к issue.
+</details>
 
-### Нагрузка
+<details>
+<summary><b>Как читать <code>css_vipbhop_trace</code></b></summary>
 
-Хуки срабатывают примерно 5 раз на игрока за тик (приём команд, SetupMove, ProcessMovement, PostThink, симуляция). Каждый обработчик делает одно чтение параметра, поиск в `HashSet` и чтение/запись значения переменной по закэшированному адресу. Строка `handler time` в `css_vipbhop_status` показывает реальное время обработчиков на вашем сервере. Время перехода CSS из движка в C# в неё не входит, оно обычно составляет единицы микросекунд на вызов. Замер на живом сервере (v2.6.1, 3 игрока): 2,74 мкс на вызов, 159 мс за ~57 секунд — около 0,3 % одного ядра. Нагрузка растёт линейно с числом игроков: при ~20 игроках это около 2 % ядра плюс время перехода CSS из движка в C#.
+<br>
 
-Найти, где в конфигах задаются эти переменные:
+```
+tick 1: U1- U0*- PRE P0*+ M0*+ T0*+ S0*+ P1- M1- T1- S1- POST
+```
+
+- `U` — приём команд, `P` — SetupMove, `M` — ProcessMovement, `T` — PostThink, `S` — завершение симуляции.
+- Затем идёт номер слота игрока, `*` у VIP и значение `sv_autobunnyhopping` на входе в функцию (`+` или `-`).
+- `PRE` и `POST` — начало и конец обработки сущностей в тике.
+
+У игрока без VIP на `P` всегда должен стоять `-`. Если там `+`, значит, он получил значение VIP.
+
+</details>
+
+### Частые проблемы
+
+| Симптом | Что проверить |
+|---|---|
+| Бхоп у всех, даже без VIP | Выгрузите модуль (`css_plugins unload VIP_Bhop`) и выполните `sv_autobunnyhopping`. Если значение `true`, его включает конфиг или другой плагин. |
+| Бхоп у игрока без VIP только пока VIP жив | Проверьте, что все хуки в логе `OK`. Затем пришлите вывод `css_vipbhop_trace` в [issues](https://github.com/koiie111/cs2-VIP-Bhop/issues). |
+| Модуль не работает после патча CS2 | Смотрите ошибку в логе и обновите сигнатуры (раздел [После обновлений CS2](#после-обновлений-cs2)). |
+| VIP прилипает к земле | Проверьте, что `MaxSpeed` равен `0`, и что в логе есть `ProcessUsercmds OK`. |
+
+Найти, где в конфигах включаются эти переменные:
 
 ```bash
 grep -rniE "autobunnyhopping|enablebunnyhopping" game/csgo/cfg game/csgo/addons game/csgo/gamemodes*.txt
 ```
 
-## Сборка
+## Производительность
+
+Хуки срабатывают примерно 5 раз на игрока за тик. Каждый обработчик читает один параметр, делает одну проверку в `HashSet` и пишет значение по заранее сохранённому адресу.
+
+Замер на живом сервере: **2,7 мкс на вызов, около 0,3 % одного ядра при трёх игроках**. Нагрузка растёт пропорционально числу игроков, при 20 игроках это около 2 %. Ещё добавляется время перехода CSS из движка в C#, в замер оно не входит. Актуальные цифры для вашего сервера показывает строка `handler time` в `css_vipbhop_status`.
+
+## Сборка из исходников
 
 ```bash
 dotnet build VIP_Bhop.csproj -c Release
 ```
 
-Результат появится в `build/addons/counterstrikesharp/...` в том же виде, что на сервере. `lib/VipCoreApi.dll` взят из [cs2-VIPCore](https://github.com/partiusfabaa/cs2-VIPCore) (MIT) и в сборку не копируется. При пуше тега `v*` GitHub Actions собирает релиз с `VIP_Bhop.zip`.
+Готовые файлы появятся в `build/addons/counterstrikesharp/...` в той же структуре, что на сервере. Для сборки нужен .NET SDK 10. Файл `lib/VipCoreApi.dll` взят из [cs2-VIPCore](https://github.com/partiusfabaa/cs2-VIPCore) (MIT) и в сборку не копируется. При пуше тега `v*` GitHub Actions сам выпускает релиз с `VIP_Bhop.zip`.
 
----
+## Благодарности
 
-## English
+- [thesamefabius / partiusfabaa](https://github.com/partiusfabaa/cs2-VIPCore) — VIP Core и оригинальный модуль `VIP_Bhop`
+- [KZGlobalTeam/cs2kz-metamod](https://github.com/KZGlobalTeam/cs2kz-metamod) — приём с переменными для отдельного игрока
+- [ianlucas/cs2-signatures](https://github.com/ianlucas/cs2-signatures) — трекер сигнатур
 
-**VIP-only auto bunnyhop** for [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore), built on CS2's native movement cvars. It is a drop-in replacement for the original `VIP_Bhop` module: same feature name (`Bhop`) and the same group settings.
-
-**How it works** (same technique as the cs2kz-metamod autobhop style):
-- `FCVAR_REPLICATED` is removed from `sv_autobunnyhopping` and `sv_enablebunnyhopping`, so the server never broadcasts them.
-- Each client receives its own value through a single-recipient `CNETMsg_SetConVar`: `true` for an active VIP, the real server value for everyone else.
-- `CCSPlayerController::ProcessUsercmds` (commands received) and `CBasePlayerController::OnSimulateUserCommands` (commands simulated: `SetupMove`, `ProcessMovement`, ...) are hooked. `ProcessMovement` is hooked as a second guard.
-- At each of these entry points every player gets their own value written straight into memory: `true` for an active VIP, the real value for everyone else. Hooks are pass-through: the plugin never calls or skips game functions (on CSS 1.0.375+/KHook that re-ran VIP commands: speedhack, teleports) and uses no post hooks.
-
-**Install:**
-1. Remove the original `VIP_Bhop`.
-2. Extract the release zip into `game/csgo/`.
-3. Restart the server; gamedata is only loaded at startup.
-
-**Group config:** `"Bhop": { "Timer": 5, "MaxSpeed": 0 }`. `Timer` is the activation delay after freezetime; `MaxSpeed` is a horizontal speed cap, `0` means no cap.
-
-**Signatures** live in `addons/counterstrikesharp/gamedata/vip_bhop.json`. Get fresh ones from [ianlucas/cs2-signatures](https://github.com/ianlucas/cs2-signatures). `OnSimulateUserCommands`, `SetupMove` and `ProcessMovement` are required; if either is missing or outdated, the module logs an error and does nothing. `ProcessUsercmds` is optional: without it a VIP's value may reach the player processed right after them.
-
-**Diagnostics:** run `css_vipbhop_status` from the server console, or from the client console as a `@css/root` admin.
-
-**Requirements:** CounterStrikeSharp >= 1.0.375 (.NET 10), VIP Core.
-
-## Credits
-
-- [thesamefabius / partiusfabaa](https://github.com/partiusfabaa/cs2-VIPCore): VIP Core and the original `VIP_Bhop` module (MIT)
-- [KZGlobalTeam/cs2kz-metamod](https://github.com/KZGlobalTeam/cs2kz-metamod): per-player cvar technique
-- [ianlucas/cs2-signatures](https://github.com/ianlucas/cs2-signatures): signature tracker
-
-## License
+## Лицензия
 
 [MIT](LICENSE)
