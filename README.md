@@ -4,7 +4,7 @@
 
 A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStrikeSharp: **VIP-only** auto bunnyhop driven by CS2's own `sv_autobunnyhopping` / `sv_enablebunnyhopping`, with no sticking or jitter. Everyone else keeps vanilla movement. English section is [below](#english).
 
-> **Статус: beta.** Собирается под CounterStrikeSharp 1.0.376 / CS2 1.41.8.x (обновление 23.09.2026). У VIP бхоп работает; есть открытый вопрос: обычные игроки тоже могут распрыгиваться. Перед запуском посмотрите раздел [Диагностика](#диагностика).
+> Проверено на сервере с CounterStrikeSharp 1.0.376 / CS2 1.41.8.x (обновление 23.09.2026), версия v2.6.0: у VIP бхоп без прилипаний и телепортов, у обычных игроков движение ванильное (проверено через `css_vipbhop_trace`).
 
 ---
 
