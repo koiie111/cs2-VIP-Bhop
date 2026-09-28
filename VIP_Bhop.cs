@@ -17,7 +17,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.0.2";
+    public override string ModuleVersion => "v2.1.0";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -60,8 +60,9 @@ public class Bhop : VipFeatureBase, IDisposable
     private const string AutoBhopName = "sv_autobunnyhopping";
     private const string EnableBhopName = "sv_enablebunnyhopping";
 
-    // Key in addons/counterstrikesharp/gamedata/vip_bhop.json
+    // Keys in addons/counterstrikesharp/gamedata/vip_bhop.json
     private const string ProcessMovementKey = "VIP_Bhop_CCSPlayer_MovementServices_ProcessMovement";
+    private const string SimulateUserCommandsKey = "VIP_Bhop_CBasePlayerController_OnSimulateUserCommands";
 
     private readonly VIP_Bhop _plugin;
     private readonly PlayerState[] _states = new PlayerState[65];
@@ -72,9 +73,11 @@ public class Bhop : VipFeatureBase, IDisposable
     private readonly ConVarFlags _enableBhopFlags;
 
     private readonly MemoryFunctionVoid<IntPtr, IntPtr>? _processMovement;
+    private readonly MemoryFunctionVoid<IntPtr>? _simulateUserCommands;
 
-    // MovementServices pointer -> VIP pawn, rebuilt every tick
-    private readonly Dictionary<IntPtr, CCSPlayerPawn> _activeServices = new();
+    // Rebuilt every tick: MovementServices pointers and controller pointers of VIPs with active bhop
+    private readonly HashSet<IntPtr> _activeServices = new();
+    private readonly HashSet<IntPtr> _activeControllers = new();
 
     // Real server values. Captured only while no override is applied, so they can never pick up "true" from a VIP.
     private bool _realAutoBhop;
@@ -82,6 +85,7 @@ public class Bhop : VipFeatureBase, IDisposable
     private bool _overridden;
 
     // Diagnostics (css_vipbhop_status)
+    private long _simulateCalls;
     private long _preCalls;
     private long _postCalls;
     private long _vipCalls;
@@ -100,17 +104,26 @@ public class Bhop : VipFeatureBase, IDisposable
             return;
         }
 
+        // Every player's command processing starts with OnSimulateUserCommands (it runs SetupMove, which already
+        // reads movement cvars, then ProcessMovement). Setting the per-player value at both entry points means
+        // no player ever runs with another player's value, and no post hook is needed (it does not fire on
+        // CSS 1.0.375+/KHook). Both hooks are required: with only one of them the override could leak.
         try
         {
+            _simulateUserCommands = new MemoryFunctionVoid<IntPtr>(GameData.GetSignature(SimulateUserCommandsKey));
             _processMovement = new MemoryFunctionVoid<IntPtr, IntPtr>(GameData.GetSignature(ProcessMovementKey));
+            _simulateUserCommands.Hook(SimulateUserCommandsPre, HookMode.Pre);
             _processMovement.Hook(ProcessMovementPre, HookMode.Pre);
             _processMovement.Hook(ProcessMovementPost, HookMode.Post);
         }
         catch (Exception e)
         {
+            _simulateUserCommands?.Unhook(SimulateUserCommandsPre, HookMode.Pre);
+            _simulateUserCommands = null;
             _processMovement = null;
             plugin.Logger.LogError(e,
-                "[VIP Bhop] {0} is missing or outdated in gamedata/vip_bhop.json. Bhop is disabled", ProcessMovementKey);
+                "[VIP Bhop] {0} / {1} missing or outdated in gamedata/vip_bhop.json. Bhop is disabled",
+                SimulateUserCommandsKey, ProcessMovementKey);
             return;
         }
 
@@ -170,6 +183,7 @@ public class Bhop : VipFeatureBase, IDisposable
     private void OnTick()
     {
         _activeServices.Clear();
+        _activeControllers.Clear();
 
         // Safety net: an override must never survive until the next tick
         if (_overridden)
@@ -200,7 +214,8 @@ public class Bhop : VipFeatureBase, IDisposable
             var services = pawn?.MovementServices;
             if (pawn == null || services == null) continue;
 
-            _activeServices[services.Handle] = pawn;
+            _activeServices.Add(services.Handle);
+            _activeControllers.Add(player.Handle);
 
             if (state.MaxSpeed > 0)
                 ClampSpeed(player, pawn, state.MaxSpeed);
@@ -222,11 +237,23 @@ public class Bhop : VipFeatureBase, IDisposable
         }
     }
 
+    private HookResult SimulateUserCommandsPre(DynamicHook hook)
+    {
+        _simulateCalls++;
+        Apply(_activeControllers.Count > 0 && _activeControllers.Contains(hook.GetParam<IntPtr>(0)));
+        return HookResult.Continue;
+    }
+
     private HookResult ProcessMovementPre(DynamicHook hook)
     {
         _preCalls++;
+        Apply(_activeServices.Count > 0 && _activeServices.Contains(hook.GetParam<IntPtr>(0)));
+        return HookResult.Continue;
+    }
 
-        if (_activeServices.Count > 0 && _activeServices.ContainsKey(hook.GetParam<IntPtr>(0)))
+    private void Apply(bool vip)
+    {
+        if (vip)
         {
             _vipCalls++;
             _autoBhop!.GetPrimitiveValue<bool>() = true;
@@ -235,12 +262,10 @@ public class Bhop : VipFeatureBase, IDisposable
         }
         else if (_overridden)
         {
-            // Post of the previous VIP call did not run: non-VIP must always move with the real values
+            // The previous player was a VIP: this one must run with the real values
             _staleRestores++;
             Restore();
         }
-
-        return HookResult.Continue;
     }
 
     private HookResult ProcessMovementPost(DynamicHook hook)
@@ -269,7 +294,7 @@ public class Bhop : VipFeatureBase, IDisposable
         info.ReplyToCommand(
             $"[VIP Bhop] flags: {AutoBhopName}={_autoBhop?.Flags} {EnableBhopName}={_enableBhop?.Flags}");
         info.ReplyToCommand(
-            $"[VIP Bhop] ProcessMovement pre={_preCalls} post={_postCalls} vip={_vipCalls} staleRestores={_staleRestores}" +
+            $"[VIP Bhop] simulate={_simulateCalls} ProcessMovement pre={_preCalls} post={_postCalls} vip={_vipCalls} staleRestores={_staleRestores}" +
             (_postCalls == 0 && _preCalls > 0 ? " (post hook not firing, fallback restore in use)" : ""));
 
         foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
@@ -277,7 +302,7 @@ public class Bhop : VipFeatureBase, IDisposable
             var st = _states[player.Slot];
             info.ReplyToCommand(
                 $"[VIP Bhop] #{player.Slot} {player.PlayerName}: enabled={st.Enabled} active={st.Active} " +
-                $"sent={st.SentAutoBhop}/{st.SentEnableBhop} inMovementSet={player.PlayerPawn.Value?.MovementServices is { } ms && _activeServices.ContainsKey(ms.Handle)}");
+                $"sent={st.SentAutoBhop}/{st.SentEnableBhop} inMovementSet={player.PlayerPawn.Value?.MovementServices is { } ms && _activeServices.Contains(ms.Handle)} inControllerSet={_activeControllers.Contains(player.Handle)}");
         }
     }
 
@@ -347,6 +372,7 @@ public class Bhop : VipFeatureBase, IDisposable
     {
         if (_processMovement == null) return;
 
+        _simulateUserCommands?.Unhook(SimulateUserCommandsPre, HookMode.Pre);
         _processMovement.Unhook(ProcessMovementPre, HookMode.Pre);
         _processMovement.Unhook(ProcessMovementPost, HookMode.Post);
 

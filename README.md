@@ -21,8 +21,8 @@ A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStri
 
 1. С `sv_autobunnyhopping` и `sv_enablebunnyhopping` снимается флаг `FCVAR_REPLICATED`, и сервер больше не рассылает их всем.
 2. Каждому клиенту значение отправляется отдельно (`CNETMsg_SetConVar` одному получателю) и только при изменении: VIP с активным бхопом получает `true`, остальные — реальное значение сервера.
-3. Функция `CCSPlayer_MovementServices::ProcessMovement` перехватывается. На время движения VIP общее значение в памяти ставится в `true` и сразу возвращается обратно. Колбэки изменения не вызываются, рассылки нет.
-4. Перед движением любого не-VIP принудительно ставится реальное значение. Ещё значение возвращается после фазы обработки сущностей и каждый тик. Поэтому подмена не может «утечь» на других игроков, даже там, где post-хук не срабатывает (CSS 1.0.375+).
+3. Перехватываются две функции: `CBasePlayerController::OnSimulateUserCommands` (начало обработки команд игрока, до `SetupMove`) и `CCSPlayer_MovementServices::ProcessMovement`. В обеих точках для **каждого** игрока в память пишется его значение: VIP получает `true`, остальные — реальное значение сервера. Колбэки изменения не вызываются, рассылки нет.
+4. Раз значение выставляется в начале обработки каждого игрока, код движения никогда не видит значение другого игрока, и post-хук не нужен (на CSS 1.0.375+ он не срабатывает). Кроме того, реальное значение возвращается после фазы обработки сущностей и каждый тик.
 
 В итоге клиент и сервер считают движение VIP одинаково по встроенному автобхопу CS2.
 
@@ -62,24 +62,17 @@ A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStri
 
 ## Gamedata / сигнатуры
 
-Сигнатура хранится в отдельном файле [`gamedata/vip_bhop.json`](gamedata/vip_bhop.json):
+Сигнатуры хранятся в отдельном файле [`gamedata/vip_bhop.json`](gamedata/vip_bhop.json):
 
-```json
-{
-  "VIP_Bhop_CCSPlayer_MovementServices_ProcessMovement": {
-    "signatures": {
-      "library": "server",
-      "windows": "40 57 41 57 48 81 EC ? ? ? ? 48 83 79",
-      "linux": "55 48 89 E5 41 57 41 56 41 55 49 89 F5 41 54 53 48 89 FB 48 83 EC ? 48 8B 7F"
-    }
-  }
-}
-```
+| Ключ | Функция в [cs2-signatures](https://github.com/ianlucas/cs2-signatures) |
+|---|---|
+| `VIP_Bhop_CBasePlayerController_OnSimulateUserCommands` | SwiftlyS2 → `CBasePlayerController::OnSimulateUserCommands` (у cs2kz называется `PhysicsSimulate`) |
+| `VIP_Bhop_CCSPlayer_MovementServices_ProcessMovement` | CS2Fixes / SwiftlyS2 → `ProcessMovement` |
 
 - CSS при старте загружает все `*.json` из папки gamedata. Автообновление CSS перезаписывает только свой `gamedata.json`, так что этот файл не затрётся.
 - Ключ уникальный, чтобы устаревшая запись с тем же именем от другого плагина его не перекрыла.
-- После обновлений CS2 актуальные сигнатуры можно взять в [ianlucas/cs2-signatures](https://github.com/ianlucas/cs2-signatures) (CS2Fixes / SwiftlyS2 → `ProcessMovement`, колонка IDA-Style). После правки файла перезапустите сервер.
-- Если сигнатура не найдена, плагин пишет ошибку в лог и **ничего не меняет**: переменные остаются как на ванильном сервере.
+- После обновлений CS2 берите значения из колонки IDA-Style и перезапускайте сервер.
+- Нужны **обе** сигнатуры. Если хотя бы одна не найдена, плагин пишет ошибку в лог и **ничего не меняет**: переменные остаются как на ванильном сервере. С одним хуком подмена могла бы утечь на других игроков.
 
 ## Диагностика
 
@@ -89,13 +82,15 @@ A [VIP Core](https://github.com/partiusfabaa/cs2-VIPCore) module for CounterStri
 [VIP Bhop] hook: OK
 [VIP Bhop] real values: sv_autobunnyhopping=False sv_enablebunnyhopping=False, overridden now: False
 [VIP Bhop] flags: ...
-[VIP Bhop] ProcessMovement pre=123456 post=123456 vip=4321 staleRestores=0
-[VIP Bhop] #0 Player: enabled=True active=True sent=True/True inMovementSet=True
+[VIP Bhop] simulate=45000 ProcessMovement pre=50000 post=0 vip=30000 staleRestores=29000 (post hook not firing, fallback restore in use)
+[VIP Bhop] #0 Player: enabled=True active=True sent=True/True inMovementSet=True inControllerSet=True
 ```
 
 - `real values` должны совпадать с вашим `server.cfg`. Если там `True`, переменную включает конфиг или другой плагин, а не этот модуль. Проверьте так: `css_plugins unload VIP_Bhop`, затем `sv_autobunnyhopping`.
-- `post=0` на CSS 1.0.375+ (KHook) — это нормально: post-хук `ProcessMovement` там не вызывается. Модуль от него не зависит. Реальное значение возвращается перед движением каждого не-VIP (`staleRestores`) и сразу после фазы обработки сущностей в каждом кадре.
-- `vip` должен расти только пока VIP двигается, а у обычных игроков должно быть `enabled=False sent=False/False inMovementSet=False`.
+- `simulate` и `pre` должны расти. Если `simulate=0`, хук начала обработки команд не срабатывает. Создайте issue и приложите вывод команды.
+- `post=0` на CSS 1.0.375+ (KHook) — это нормально, модуль от post-хука не зависит.
+- У обычных игроков должно быть `enabled=False sent=False/False inMovementSet=False inControllerSet=False`.
+- Если обычный игрок всё равно распрыгивается с зажатым пробелом, выполните `sv_autobunnyhopping` **в консоли его клиента**. Если там `true`, значение утекает к клиенту по сети (например, из-за устаревшего CSS). Если `false`, проблема на стороне сервера.
 
 Найти, где в конфигах задаются эти переменные:
 
@@ -120,8 +115,8 @@ dotnet build VIP_Bhop.csproj -c Release
 **How it works** (same technique as the cs2kz-metamod autobhop style):
 - `FCVAR_REPLICATED` is removed from `sv_autobunnyhopping` and `sv_enablebunnyhopping`, so the server never broadcasts them.
 - Each client receives its own value through a single-recipient `CNETMsg_SetConVar`: `true` for an active VIP, the real server value for everyone else.
-- `CCSPlayer_MovementServices::ProcessMovement` is hooked. The global value is written straight into memory as `true` only while a VIP's movement runs, and it is restored right afterwards.
-- Non-VIPs are always forced back to the real value, so client prediction and server simulation match.
+- `CBasePlayerController::OnSimulateUserCommands` (before `SetupMove`) and `CCSPlayer_MovementServices::ProcessMovement` are hooked. At both points every player gets their own value written straight into memory: `true` for an active VIP, the real value for everyone else.
+- No post hook is needed (it does not fire on CSS 1.0.375+), and the override never leaks to other players.
 
 **Install:**
 1. Remove the original `VIP_Bhop`.
@@ -130,7 +125,7 @@ dotnet build VIP_Bhop.csproj -c Release
 
 **Group config:** `"Bhop": { "Timer": 5, "MaxSpeed": 0 }`. `Timer` is the activation delay after freezetime; `MaxSpeed` is a horizontal speed cap, `0` means no cap.
 
-**Signatures** live in `addons/counterstrikesharp/gamedata/vip_bhop.json`. Get fresh ones from [ianlucas/cs2-signatures](https://github.com/ianlucas/cs2-signatures). If the signature is missing or outdated, the module logs an error and does nothing.
+**Signatures** live in `addons/counterstrikesharp/gamedata/vip_bhop.json`. Get fresh ones from [ianlucas/cs2-signatures](https://github.com/ianlucas/cs2-signatures). Two signatures are required (`OnSimulateUserCommands` and `ProcessMovement`); if either is missing or outdated, the module logs an error and does nothing.
 
 **Diagnostics:** run `css_vipbhop_status` from the server console.
 
