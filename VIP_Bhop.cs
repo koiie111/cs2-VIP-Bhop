@@ -1,6 +1,7 @@
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Capabilities;
+using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Memory;
@@ -17,7 +18,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.2.0";
+    public override string ModuleVersion => "v2.3.0";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -64,6 +65,7 @@ public class Bhop : VipFeatureBase, IDisposable
     // Keys in addons/counterstrikesharp/gamedata/vip_bhop.json
     private const string ProcessMovementKey = "VIP_Bhop_CCSPlayer_MovementServices_ProcessMovement";
     private const string SimulateUserCommandsKey = "VIP_Bhop_CBasePlayerController_OnSimulateUserCommands";
+    private const string ProcessUsercmdsKey = "VIP_Bhop_CCSPlayerController_ProcessUsercmds";
 
     private readonly VIP_Bhop _plugin;
     private readonly PlayerState[] _states = new PlayerState[65];
@@ -75,6 +77,9 @@ public class Bhop : VipFeatureBase, IDisposable
 
     private readonly MemoryFunctionVoid<IntPtr, IntPtr>? _processMovement;
     private readonly MemoryFunctionVoid<IntPtr>? _simulateUserCommands;
+
+    // int CCSPlayerController::ProcessUsercmds(CUserCmd* cmds, int numcmds, bool paused, float margin)
+    private readonly MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, int>? _processUsercmds;
 
     // Rebuilt every tick: MovementServices pointers and controller pointers of VIPs with active bhop
     private readonly HashSet<IntPtr> _activeServices = new();
@@ -89,6 +94,7 @@ public class Bhop : VipFeatureBase, IDisposable
     private readonly long[] _simulateBySlot = new long[65];
     private readonly long[] _ticksBySlot = new long[65];
     private long _simulateCalls;
+    private long _usercmdsCalls;
     private long _preCalls;
     private long _vipCalls;
     private long _staleRestores;
@@ -129,6 +135,24 @@ public class Bhop : VipFeatureBase, IDisposable
             return;
         }
 
+        // Part of the jump handling runs when the client's commands are received, outside
+        // OnSimulateUserCommands. Without this hook the VIP sticks to the ground now and then.
+        // Optional: the wrapper cannot leak, so the module still works (with some sticking) without it.
+        try
+        {
+            _processUsercmds =
+                new MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, int>(
+                    GameData.GetSignature(ProcessUsercmdsKey));
+            _processUsercmds.Hook(ProcessUsercmdsPre, HookMode.Pre);
+        }
+        catch (Exception e)
+        {
+            _processUsercmds = null;
+            plugin.Logger.LogWarning(e,
+                "[VIP Bhop] {0} missing or outdated in gamedata/vip_bhop.json, VIPs may stick to the ground",
+                ProcessUsercmdsKey);
+        }
+
         _realAutoBhop = _autoBhop.GetPrimitiveValue<bool>();
         _realEnableBhop = _enableBhop.GetPrimitiveValue<bool>();
 
@@ -142,7 +166,10 @@ public class Bhop : VipFeatureBase, IDisposable
         plugin.RegisterListener<Listeners.OnTick>(OnTick);
         plugin.RegisterListener<Listeners.OnServerPostEntityThink>(EnsureRealValues);
         plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
-        plugin.AddCommand("css_vipbhop_status", "VIP Bhop diagnostics", OnStatusCommand);
+        plugin.AddCommand("css_vipbhop_status", "VIP Bhop diagnostics (server console or @css/root)", OnStatusCommand);
+
+        plugin.Logger.LogInformation("[VIP Bhop] {0} loaded: OnSimulateUserCommands+ProcessMovement OK, ProcessUsercmds {1}",
+            plugin.ModuleVersion, _processUsercmds != null ? "OK" : "NOT FOUND");
     }
 
     private bool IsWorking => _processMovement != null;
@@ -247,6 +274,28 @@ public class Bhop : VipFeatureBase, IDisposable
         return HookResult.Handled;
     }
 
+    private HookResult ProcessUsercmdsPre(DynamicHook hook)
+    {
+        _usercmdsCalls++;
+        var controller = hook.GetParam<IntPtr>(0);
+
+        if (_activeControllers.Count == 0 || !_activeControllers.Contains(controller))
+        {
+            EnsureRealValues();
+            return HookResult.Continue;
+        }
+
+        var cmds = hook.GetParam<IntPtr>(1);
+        var numCmds = hook.GetParam<int>(2);
+        var paused = hook.GetParam<bool>(3);
+        var margin = hook.GetParam<float>(4);
+
+        var result = 0;
+        RunWithBhop(() => result = _processUsercmds!.Invoke(controller, cmds, numCmds, paused, margin, true));
+        hook.SetReturn(result);
+        return HookResult.Handled;
+    }
+
     private HookResult ProcessMovementPre(DynamicHook hook)
     {
         _preCalls++;
@@ -302,8 +351,8 @@ public class Bhop : VipFeatureBase, IDisposable
 
     private void OnStatusCommand(CCSPlayerController? caller, CommandInfo info)
     {
-        // server console / rcon only
-        if (caller != null) return;
+        // server console / rcon, or a root admin from the client console
+        if (caller != null && !AdminManager.PlayerHasPermissions(caller, "@css/root")) return;
 
         info.ReplyToCommand($"[VIP Bhop] hook: {(IsWorking ? "OK" : "NOT INSTALLED")}");
         info.ReplyToCommand(
@@ -312,7 +361,9 @@ public class Bhop : VipFeatureBase, IDisposable
         info.ReplyToCommand(
             $"[VIP Bhop] flags: {AutoBhopName}={_autoBhop?.Flags} {EnableBhopName}={_enableBhop?.Flags}");
         info.ReplyToCommand(
-            $"[VIP Bhop] simulate={_simulateCalls} processMovement={_preCalls} vipWrapped={_vipCalls} staleRestores={_staleRestores} (must stay 0)");
+            $"[VIP Bhop] {_plugin.ModuleVersion}, ProcessUsercmds hook: {(_processUsercmds != null ? "OK" : "NOT FOUND")}");
+        info.ReplyToCommand(
+            $"[VIP Bhop] usercmds={_usercmdsCalls} simulate={_simulateCalls} processMovement={_preCalls} vipWrapped={_vipCalls} staleRestores={_staleRestores} (must stay 0)");
 
         foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
         {
@@ -390,6 +441,7 @@ public class Bhop : VipFeatureBase, IDisposable
     {
         if (_processMovement == null) return;
 
+        _processUsercmds?.Unhook(ProcessUsercmdsPre, HookMode.Pre);
         _simulateUserCommands?.Unhook(SimulateUserCommandsPre, HookMode.Pre);
         _processMovement.Unhook(ProcessMovementPre, HookMode.Pre);
         EnsureRealValues();
