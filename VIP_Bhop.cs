@@ -359,7 +359,9 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
     private void OnEntityDeleted(CEntityInstance entity)
     {
         if (_activeControllers.Count == 0) return;
-        var address = entity.Handle;
+        // The entity system may no longer resolve a handle during deletion. The
+        // listener itself receives the native address before it can be reused.
+        var address = ((NativeObject)entity).Handle;
         if (_activePawns.TryGetValue(address, out var state) || _activeControllers.TryGetValue(address, out state))
             RemoveMovement(state);
     }
