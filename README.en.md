@@ -98,7 +98,7 @@ The VIP's client is sent `true` on its own, so its movement prediction matches t
   | `CCSPlayerPawnBase::PostThink` | The pawn's per-frame processing after movement |
   | `CBasePlayerController::OnSimulateUserCommands` | End of command simulation |
 
-- The hooks only set the value. The module never calls or skips game functions itself. On CSS 1.0.375+ (KHook) doing so made the game process VIP commands again: speedhack, teleports and a server crash. No post hooks are used, since they do not fire on that CSS version.
+- The hooks set the value and return control to the engine. Calling the command processing functions a second time caused excessive speed, teleports and a crash on CSS 1.0.375+ (KHook). No post hooks are used, since they do not fire on that CSS version.
 - A VIP's value is reset when the next player enters, after the entity think phase, and at the start of every tick.
 - The same idea is used by the autobhop style in [cs2kz-metamod](https://github.com/KZGlobalTeam/cs2kz-metamod).
 
@@ -175,6 +175,8 @@ Each server tick refreshes movement state for eligible VIPs and processes pendin
 
 
 On a Mirage LAN server with 12 bots and no active VIPs, the median measured handler cost went from **22.30 to 6.14 µs per tick**. The comparison with v2.6.1 used CounterStrikeSharp 1.0.380 and three 45-second windows per version with sample and trace disabled. The timing covers the C# handler bodies.
+
+With one active VIP, 12 bots and `MaxSpeed = 125`, the median across three 45-second windows was **33.72 → 23.26 µs per tick**.
 
 ## Building from source
 
