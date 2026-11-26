@@ -185,6 +185,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             plugin.RegisterListener<Listeners.OnMapEnd>(OnMapEnd);
             plugin.RegisterListener<Listeners.OnServerPostEntityThink>(OnPostEntityThink);
             plugin.RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
+            plugin.RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawned);
             plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
             plugin.RegisterEventHandler<EventRoundFreezeEnd>(OnFreezeEnd);
 
@@ -367,6 +368,14 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         _states[slot] = new PlayerState();
     }
 
+    private HookResult OnPlayerSpawned(EventPlayerSpawn gameEvent, GameEventInfo info)
+    {
+        if (_candidates.Count != 0 && gameEvent.Userid is { IsValid: true } player &&
+            _candidates.Contains(player.Slot))
+            RefreshMovement(player, _states[player.Slot]);
+        return HookResult.Continue;
+    }
+
     private HookResult OnPlayerDeath(EventPlayerDeath gameEvent, GameEventInfo info)
     {
         if (_activeControllers.Count != 0 && gameEvent.Userid is { IsValid: true } player &&
@@ -426,7 +435,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
 
         SyncPendingClients();
         foreach (var slot in _candidates)
-            RefreshMovement(slot, _states[slot]);
+            RefreshMovement(Utilities.GetPlayerFromSlot(slot), _states[slot]);
 
         if (_traceTicksLeft > 0) FlushTraceTick();
         if (_sample is { } sample && Server.TickCount - sample.StartTick >= HookSample.DurationTicks)
@@ -474,12 +483,13 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         }
     }
 
-    private void RefreshMovement(int slot, PlayerState state)
+    private void RefreshMovement(CCSPlayerController? player, PlayerState state)
     {
-        var player = Utilities.GetPlayerFromSlot(slot);
-        if (player is not { IsValid: true, Connected: PlayerConnectedState.Connected, PawnIsAlive: true } ||
+        // The controller's replicated PawnIsAlive can lag a death or respawn by several ticks.
+        if (player is not { IsValid: true, Connected: PlayerConnectedState.Connected } ||
             state.ControllerId != player.EntityHandle.Raw ||
-            player.PlayerPawn.Value is not { IsValid: true } pawn || pawn.MovementServices is not { } services)
+            player.PlayerPawn.Value is not { IsValid: true, LifeState: (byte)LifeState_t.LIFE_ALIVE } pawn ||
+            pawn.MovementServices is not { } services)
         {
             RemoveMovement(state);
             return;
