@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using CounterStrikeSharp.API;
@@ -677,11 +678,13 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             (player.Buttons & PlayerButtons.Jump) == 0) return;
 
         var velocity = pawn.AbsVelocity;
-        if (BhopSpeed.TryClamp(velocity.X, velocity.Y, maxSpeed, out var x, out var y))
-        {
-            velocity.X = x;
-            velocity.Y = y;
-        }
+        if (!BhopSpeed.TryClamp(velocity.X, velocity.Y, maxSpeed, out var x, out var y)) return;
+
+        // Writing AbsVelocity alone leaves the old velocity available to the
+        // next movement command. Apply the new velocity through the engine.
+        var z = velocity.Z;
+        if (float.IsFinite(x) && float.IsFinite(y) && float.IsFinite(z))
+            pawn.Teleport(velocity: new Vector3(x, y, z));
     }
 
     private HookResult OnRoundStart(EventRoundStart gameEvent, GameEventInfo info)
