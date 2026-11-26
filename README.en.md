@@ -63,7 +63,7 @@ Give bhop to groups in the VIP Core config, `addons/counterstrikesharp/configs/p
 | Setting | Effect |
 |---|---|
 | `Timer` | Seconds after freezetime ends before bhop turns on. During warmup it is on right away. |
-| `MaxSpeed` | Horizontal speed cap when jumping again while holding the jump button. `0` means no cap, which is the smoothest option. The cap is applied on the server, so a small correction is possible when it kicks in. |
+| `MaxSpeed` | Horizontal speed cap on the first tick after taking off with the jump button held. `0` means no cap, which is the smoothest option. The cap is applied on the server, so a small correction is possible when it kicks in. |
 
 Players toggle bhop in the VIP menu. The `bhop.TimeToActivation` and `bhop.Activated` messages come from VIP Core's language files.
 

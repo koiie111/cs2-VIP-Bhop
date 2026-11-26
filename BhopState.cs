@@ -56,6 +56,7 @@ public class PlayerState
     public bool? SentEnableBhop { get; set; }
 
     internal bool WantsBhop => Enabled && Active;
+    internal bool WasGrounded { get; set; }
     internal bool PendingSync { get; set; }
     internal string? Group { get; set; }
     internal uint? ControllerId { get; set; }

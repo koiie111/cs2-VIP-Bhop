@@ -380,6 +380,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         RemoveAddress(_activePawns, state.PawnAddress, state);
         RemoveAddress(_activeServices, state.ServicesAddress, state);
         state.ControllerAddress = IntPtr.Zero;
+        state.WasGrounded = false;
         if (_activeControllers.Count == 0)
             RestoreCvars();
     }
@@ -477,7 +478,9 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         }
 
         if (state.MaxSpeed > 0)
-            ClampSpeed(player, pawn, state.MaxSpeed);
+            ClampSpeed(player, pawn, state);
+        else
+            state.WasGrounded = false;
     }
 
     private HookResult ProcessUsercmdsPre(DynamicHook hook) =>
@@ -672,18 +675,21 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         }
     }
 
-    private static void ClampSpeed(CCSPlayerController player, CCSPlayerPawn pawn, float maxSpeed)
+    private static void ClampSpeed(CCSPlayerController player, CCSPlayerPawn pawn, PlayerState state)
     {
-        if (((PlayerFlags)pawn.Flags & PlayerFlags.FL_ONGROUND) == 0 ||
-            (player.Buttons & PlayerButtons.Jump) == 0) return;
+        var grounded = ((PlayerFlags)pawn.Flags & PlayerFlags.FL_ONGROUND) != 0;
+        var tookOff = state.WasGrounded && !grounded;
+        state.WasGrounded = grounded;
+        if (!tookOff || (player.Buttons & PlayerButtons.Jump) == 0) return;
 
         var velocity = pawn.AbsVelocity;
-        if (!BhopSpeed.TryClamp(velocity.X, velocity.Y, maxSpeed, out var x, out var y)) return;
-
-        // Writing AbsVelocity alone leaves the old velocity available to the
-        // next movement command. Apply the new velocity through the engine.
         var z = velocity.Z;
-        if (float.IsFinite(x) && float.IsFinite(y) && float.IsFinite(z))
+        if (!float.IsFinite(z) || z <= 0 ||
+            !BhopSpeed.TryClamp(velocity.X, velocity.Y, state.MaxSpeed, out var x, out var y)) return;
+
+        // Movement can reuse the landing speed when the engine processes its
+        // next jump. Apply the cap after that jump, preserving vertical speed.
+        if (float.IsFinite(x) && float.IsFinite(y))
             pawn.Teleport(velocity: new Vector3(x, y, z));
     }
 
