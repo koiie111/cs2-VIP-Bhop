@@ -174,6 +174,8 @@ grep -rniE "autobunnyhopping|enablebunnyhopping" game/csgo/cfg game/csgo/addons 
 Each server tick refreshes movement state for eligible VIPs and processes pending cvar updates. An idle client receives updates only when its effective values change. When no living VIP needs an override, movement hooks can return without reading the native argument. Order tracing and exact timing run on request.
 
 
+On a Mirage LAN server with 12 bots and no active VIPs, the median measured handler cost went from **22.30 to 6.14 µs per tick**. The comparison with v2.6.1 used CounterStrikeSharp 1.0.380 and three 45-second windows per version with sample and trace disabled. The timing covers the C# handler bodies.
+
 ## Building from source
 
 ```bash
