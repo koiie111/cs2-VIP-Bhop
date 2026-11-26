@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Reflection;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Capabilities;
@@ -124,7 +125,10 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
     private bool _seedClients = true;
     private bool _disposed;
     private int _round;
+    private EventInfo? _featureStateSet;
+    private EventInfo? _availabilityChanged;
 
+    private bool _sampleRequested;
     private HookSample? _sample;
     private HookSample? _lastSample;
     private readonly Dictionary<IntPtr, int> _controllerSlots = new(65);
@@ -182,6 +186,14 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             plugin.RegisterListener<Listeners.OnServerPostEntityThink>(OnPostEntityThink);
             plugin.RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
             plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
+            plugin.RegisterEventHandler<EventRoundFreezeEnd>(OnFreezeEnd);
+
+            // These notifications are optional extensions to the original VIP Core API.
+            var coreType = api.GetType();
+            _featureStateSet = coreType.GetInterface("VipCoreApi.IVipFeatureStateApi")?.GetEvent("PlayerFeatureStateSet");
+            _availabilityChanged = coreType.GetInterface("VipCoreApi.IVipFeatureAvailabilityApi")?.GetEvent("FeatureAvailabilityChanged");
+            _featureStateSet?.AddEventHandler(api, (Action<CCSPlayerController, string, FeatureState>)OnFeatureStateSet);
+            _availabilityChanged?.AddEventHandler(api, (Action)RefreshPlayers);
             _mapReady = true;
         }
         catch (Exception e)
@@ -233,17 +245,6 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         _enable.SetAddress((bool*)Unsafe.AsPointer(ref _enableBhop!.GetPrimitiveValue<bool>()));
     }
 
-    private void SeedClients()
-    {
-        foreach (var player in Utilities.GetPlayers())
-        {
-            if (player is not { IsBot: false, IsHLTV: false }) continue;
-            QueueSync(player.Slot);
-            if (IsClientVip(player))
-                OnPlayerLoaded(player, GetClientVipGroup(player));
-        }
-    }
-
     private void OnMapStart(string map)
     {
         if (!IsWorking) return;
@@ -260,6 +261,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         _mapReady = false;
         _round++;
         StopTrace();
+        _sampleRequested = false;
         _sample = null;
         _lastSample = null;
         _controllerSlots.Clear();
@@ -286,35 +288,52 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         return state;
     }
 
-    public override void OnPlayerLoaded(CCSPlayerController player, string group)
-    {
-        if (!IsWorking || GetState(player) is not { } state) return;
-        var eligible = PlayerHasFeature(player);
-        if (!eligible || (state.Group != null && state.Group != group))
-            state.Generation++;
-        state.Group = group;
-        state.Enabled = eligible && GetPlayerFeatureState(player) == FeatureState.Enabled;
-        if (state.Enabled)
-            state.MaxSpeed = GetFeatureValue<BhopSettings>(player).MaxSpeed;
-        UpdateEligibility(player.Slot, state);
-    }
+    public override void OnPlayerLoaded(CCSPlayerController player, string group) => RefreshPlayer(player);
 
     public override void OnPlayerRemoved(CCSPlayerController player, string group)
     {
-        if (!IsWorking || GetState(player) is not { } state) return;
+        if (!_mapReady || GetState(player) is not { } state) return;
         state.Generation++;
-        state.Group = null;
         state.Enabled = false;
+        state.Active = false;
         UpdateEligibility(player.Slot, state);
     }
 
-    public override void OnSelectItem(CCSPlayerController player, FeatureState state)
+    public override void OnSelectItem(CCSPlayerController player, FeatureState state) => RefreshPlayer(player);
+
+    private void OnFeatureStateSet(CCSPlayerController player, string feature, FeatureState state)
     {
-        if (!IsWorking || GetState(player) is not { } current) return;
-        current.Enabled = state == FeatureState.Enabled;
-        if (current.Enabled)
-            current.MaxSpeed = GetFeatureValue<BhopSettings>(player).MaxSpeed;
-        UpdateEligibility(player.Slot, current);
+        if (feature == Feature) RefreshPlayer(player);
+    }
+
+    private void RefreshPlayer(CCSPlayerController player)
+    {
+        if (_mapReady && GetState(player) is { } state)
+            RefreshPlayer(player, state, GetGameRules());
+    }
+
+    private void RefreshPlayer(CCSPlayerController player, PlayerState state, CCSGameRules? rules)
+    {
+        var generation = ++state.Generation;
+        state.Enabled = IsClientVip(player) && PlayerHasFeature(player) &&
+            GetPlayerFeatureState(player) == FeatureState.Enabled;
+        state.Active = false;
+        if (state.Enabled && rules != null)
+        {
+            var settings = GetFeatureValue<BhopSettings>(player);
+            state.MaxSpeed = settings.MaxSpeed;
+            var delay = BhopActivation.Remaining(rules.WarmupPeriod, rules.FreezePeriod,
+                rules.RoundStartTime, Server.CurrentTime, settings.Timer);
+            state.Active = delay == 0;
+            if (delay is > 0)
+            {
+                PrintToChat(player, GetTranslatedText("bhop.TimeToActivation", Math.Ceiling(delay.Value)));
+                var slot = player.Slot;
+                var round = _round;
+                _plugin.AddTimer(delay.Value, () => Activate(slot, state, round, generation), TimerFlags.STOP_ON_MAPCHANGE);
+            }
+        }
+        UpdateEligibility(player.Slot, state);
     }
 
     private void UpdateEligibility(int slot, PlayerState state)
@@ -393,7 +412,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             // The engine's globals are available on the first tick, even when the
             // plugin was registered before the initial map had finished loading.
             _seedClients = false;
-            SeedClients();
+            RefreshPlayers();
         }
 
         RefreshCvarPointers();
@@ -419,6 +438,12 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             Server.PrintToConsole("[VIP Bhop] sample complete. Run css_vipbhop_status for results.");
         }
 
+        if (_sampleRequested)
+        {
+            // Start on a tick boundary so the first and last intervals are both complete.
+            _sample = new HookSample(Server.TickCount, _states.Length);
+            _sampleRequested = false;
+        }
         if (_sample != null || _traceLine != null)
             RefreshDiagnosticSlots();
     }
@@ -641,11 +666,11 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         {
             if (!_mapReady)
                 info.ReplyToCommand("[VIP Bhop] No active map");
-            else if (_sample != null)
+            else if (_sampleRequested || _sample != null)
                 info.ReplyToCommand("[VIP Bhop] A sample is already running");
             else
             {
-                _sample = new HookSample(Server.TickCount, _states.Length);
+                _sampleRequested = true;
                 info.ReplyToCommand("[VIP Bhop] Sampling for 10 seconds of game time. Run css_vipbhop_status for results.");
             }
             return;
@@ -657,7 +682,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             info.ReplyToCommand($"[VIP Bhop] real values: {AutoBhopName}={_auto.Baseline} {EnableBhopName}={_enable.Baseline}, " +
                 $"current: {_auto.Current}/{_enable.Current}, flags: {_autoBhop?.Flags}/{_enableBhop?.Flags}");
 
-        if (_sample != null) info.ReplyToCommand("[VIP Bhop] Sample in progress");
+        if (_sampleRequested || _sample != null) info.ReplyToCommand("[VIP Bhop] Sample in progress");
         if (_lastSample is { } sample)
             info.ReplyToCommand(sample.Report());
         else
@@ -696,36 +721,26 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
     private HookResult OnRoundStart(EventRoundStart gameEvent, GameEventInfo info)
     {
         if (!_mapReady) return HookResult.Continue;
-        var round = ++_round;
-        if (GetGameRules() is not { } rules) return HookResult.Continue;
-        var warmup = rules.WarmupPeriod;
-        var freezeTime = rules.FreezeTime;
+        _round++;
+        RefreshPlayers();
+        return HookResult.Continue;
+    }
+
+    private HookResult OnFreezeEnd(EventRoundFreezeEnd gameEvent, GameEventInfo info)
+    {
+        RefreshPlayers();
+        return HookResult.Continue;
+    }
+
+    private void RefreshPlayers()
+    {
+        if (!_mapReady) return;
+        var rules = GetGameRules();
         foreach (var player in Utilities.GetPlayers())
         {
-            if (GetState(player) is not { } state) continue;
-            var slot = player.Slot;
-            state.Active = false;
-            state.Enabled = IsClientVip(player) && PlayerHasFeature(player) &&
-                GetPlayerFeatureState(player) == FeatureState.Enabled;
-
-            if (state.Enabled)
-            {
-                var settings = GetFeatureValue<BhopSettings>(player);
-                state.MaxSpeed = settings.MaxSpeed;
-                state.Active = warmup;
-                if (!warmup)
-                {
-                    PrintToChat(player, GetTranslatedText("bhop.TimeToActivation", settings.Timer));
-                    var generation = state.Generation;
-                    _plugin.AddTimer(settings.Timer + freezeTime,
-                        () => Activate(slot, state, round, generation), TimerFlags.STOP_ON_MAPCHANGE);
-                }
-            }
-
-            UpdateEligibility(slot, state);
+            if (GetState(player) is { } state)
+                RefreshPlayer(player, state, rules);
         }
-
-        return HookResult.Continue;
     }
 
     private void Activate(int slot, PlayerState state, int round, int generation)
@@ -735,9 +750,8 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             state.ControllerId != player.EntityHandle.Raw)
             return;
 
-        state.Active = true;
-        UpdateEligibility(slot, state);
-        PrintToChat(player, GetTranslatedText("bhop.Activated"));
+        RefreshPlayer(player, state, GetGameRules());
+        if (state.Active) PrintToChat(player, GetTranslatedText("bhop.Activated"));
     }
 
     private static CCSGameRules? GetGameRules()
@@ -759,8 +773,11 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         _mapReady = false;
         _disposed = true;
         StopTrace();
+        _sampleRequested = false;
         _sample = null;
         _controllerSlots.Clear();
+        _featureStateSet?.RemoveEventHandler(Api, (Action<CCSPlayerController, string, FeatureState>)OnFeatureStateSet);
+        _availabilityChanged?.RemoveEventHandler(Api, (Action)RefreshPlayers);
         Api.OnPlayerSpawn -= OnPlayerSpawn;
         Api.PlayerLoaded -= OnPlayerLoaded;
         Api.PlayerRemoved -= OnPlayerRemoved;

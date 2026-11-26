@@ -28,7 +28,7 @@ It replaces the original `VIP_Bhop` module as is: same feature name and the same
 | Bhop for non-VIPs | Can happen after CS2 updates | No, verified with a hook call trace |
 | Speed cap | Vanilla landing cap plus `MaxSpeed` | No vanilla cap (`sv_enablebunnyhopping`), only `MaxSpeed` |
 
-> Tested on CS2 1.41.8.x (the 2026-09-23 update) with CounterStrikeSharp 1.0.376.
+> LAN-tested on CS2 1.41.9.9 (build 10955) with CounterStrikeSharp 1.0.380 and VIP Core v1.0.0 (`vipcore:core`).
 
 ## Quick start
 
@@ -62,7 +62,7 @@ Give bhop to groups in the VIP Core config, `addons/counterstrikesharp/configs/p
 
 | Setting | Effect |
 |---|---|
-| `Timer` | Seconds after freezetime ends before bhop turns on. During warmup it is on right away. |
+| `Timer` | Seconds after freeze time ends. Joining, enabling bhop or reloading the module mid-round uses the time already elapsed. Warmup enables bhop immediately. |
 | `MaxSpeed` | Horizontal speed cap on the first tick after taking off with the jump button held. `0` means no cap, which is the smoothest option. The cap is applied on the server, so a small correction is possible when it kicks in. |
 
 Players toggle bhop in the VIP menu. The `bhop.TimeToActivation` and `bhop.Activated` messages come from VIP Core's language files.

@@ -58,7 +58,6 @@ public class PlayerState
     internal bool WantsBhop => Enabled && Active;
     internal bool WasGrounded { get; set; }
     internal bool PendingSync { get; set; }
-    internal string? Group { get; set; }
     internal uint? ControllerId { get; set; }
     internal IntPtr ControllerAddress { get; set; }
     internal uint PawnId { get; set; }
@@ -85,6 +84,17 @@ public class BhopSettings
 {
     public float Timer { get; set; }
     public float MaxSpeed { get; set; }
+}
+
+internal static class BhopActivation
+{
+    // Freeze time can be extended by the engine. round_freeze_end signals when the countdown can start.
+    public static float? Remaining(bool warmup, bool frozen, float roundStart, float now, float timer)
+    {
+        if (warmup) return 0;
+        if (frozen) return null;
+        return Math.Max(0, roundStart + Math.Max(0, timer) - now);
+    }
 }
 
 internal static class BhopSpeed

@@ -85,6 +85,12 @@ static int Send(PlayerState state, bool baselineAuto, bool baselineEnable)
 
 static void CheckTimers()
 {
+    Check(BhopActivation.Remaining(true, true, 50, 35, 5) == 0, "VIP granted during warmup");
+    Check(BhopActivation.Remaining(false, true, 50, 60, 5) == null, "Extended freeze waits for the engine");
+    Check(BhopActivation.Remaining(false, false, 50, 51, 5) == 4, "Mid-round enable waits only the remaining delay");
+    Check(BhopActivation.Remaining(false, false, 50, 55, 5) == 0, "Activation at the deadline");
+    Check(BhopActivation.Remaining(false, false, 50, 60, 5) == 0, "Late join or hot reload after the deadline");
+
     var slot = new PlayerState();
     Check(PlayerState.IsCurrent(slot, slot, 1, 1, 0), "Current connection and round");
     Check(!PlayerState.IsCurrent(new PlayerState(), slot, 1, 1, 0), "Reused slot");
