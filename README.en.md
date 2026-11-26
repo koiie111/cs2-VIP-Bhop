@@ -46,7 +46,7 @@ It replaces the original `VIP_Bhop` module as is: same feature name and the same
 When the module has loaded correctly, the server log shows:
 
 ```
-[VIP Bhop] v2.6.1 loaded: OnSimulateUserCommands+SetupMove+ProcessMovement OK, ProcessUsercmds OK, PostThink OK
+[VIP Bhop] v2.6.2 loaded: OnSimulateUserCommands+SetupMove+ProcessMovement OK, ProcessUsercmds OK, PostThink OK
 ```
 
 ## Configuration
@@ -129,33 +129,13 @@ Both commands work from the server console, over rcon, and from the in-game cons
 
 | Command | What it shows |
 |---|---|
-| `css_vipbhop_status` | Hook status, cvar values, call counters, handler time and each player's state |
+| `css_vipbhop_status` | Hook status, server and client cvars, player state and the last completed sample |
+| `css_vipbhop_status sample` | Starts a 10-second sample of hook calls, handler time and simulations per tick |
 | `css_vipbhop_trace` | The call order over 3 ticks: which function, for which player, and the value at entry |
 
 > In the in-game console CS2 first prints `Unknown command`. That is expected: the command still reaches the server, and the reply follows.
 
-<details>
-<summary><b>Reading <code>css_vipbhop_status</code></b></summary>
-
-<br>
-
-```
-[VIP Bhop] hook: OK
-[VIP Bhop] real values: sv_autobunnyhopping=False sv_enablebunnyhopping=False, current: False/False
-[VIP Bhop] v2.6.1, ProcessUsercmds hook: OK, PostThink hook: OK
-[VIP Bhop] handler time: 159.0 ms total, 2.74 us per call (58002 calls; CSS native-to-managed dispatch not included)
-[VIP Bhop] usercmds=11515 simulate=11639 setupMove=11032 processMovement=12784 postThink=11032 vip=17845 restores=5466
-[VIP Bhop] #0 koiie: enabled=True active=True sent=True/True inMovementSet=True inControllerSet=True simulate/tick=1.00
-[VIP Bhop] #1 Malw: enabled=False active=False sent=False/False inMovementSet=False inControllerSet=False simulate/tick=1.00
-```
-
-- **`real values`** should match your `server.cfg`, usually `False`.
-- **The call counters** should be roughly equal. If `processMovement` is far above `simulate`, commands are being processed twice, which is a bug.
-- **`restores`** counts how many times a VIP's value was reset before another player. It is expected to grow.
-- **`simulate/tick`** should be about `1.00` for every player.
-- **A non-VIP player** should show `False` everywhere.
-
-</details>
+Run `css_vipbhop_status` again after the server reports that sampling has finished. Compare `real values` with your server configuration. Check the `sent` cvars for each player and compare `simulate/tick` for players with a completed sample. The `restores` counter records times the plugin wrote the server values back. Handler time covers the measured managed hook bodies. The engine-to-C# dispatch is outside this interval.
 
 <details>
 <summary><b>Reading <code>css_vipbhop_trace</code></b></summary>
@@ -170,7 +150,7 @@ tick 1: U1- U0*- PRE P0*+ M0*+ T0*+ S0*+ P1- M1- T1- S1- POST
 - Then comes the player slot, `*` for a VIP, and the value of `sv_autobunnyhopping` at entry (`+` or `-`).
 - `PRE` and `POST` mark the start and end of the entity think phase in the tick.
 
-A non-VIP must always show `-` on `P`. A `+` there means they got a VIP's value.
+The marker shows the value at hook entry. The hook applies the player's value before the engine continues.
 
 </details>
 
@@ -191,9 +171,8 @@ grep -rniE "autobunnyhopping|enablebunnyhopping" game/csgo/cfg game/csgo/addons 
 
 ## Performance
 
-The hooks fire about 5 times per player per tick. Each handler reads one parameter, does one `HashSet` lookup and writes the value to a cached address.
+Each server tick refreshes movement state for eligible VIPs and processes pending cvar updates. An idle client receives updates only when its effective values change. When no living VIP needs an override, movement hooks can return without reading the native argument. Order tracing and exact timing run on request.
 
-Measured on a live server: **2.7 µs per call, about 0.3 % of one core with three players**. The load grows in proportion to the player count, about 2 % at 20 players. CSS's native-to-C# dispatch comes on top and is not included in that figure. The `handler time` line in `css_vipbhop_status` shows the numbers for your server.
 
 ## Building from source
 

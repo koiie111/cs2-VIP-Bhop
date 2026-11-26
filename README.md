@@ -46,7 +46,7 @@ VIP-игрок прыгает на родном автобхопе CS2 (`sv_auto
 Если модуль загрузился правильно, в логе сервера будет строка:
 
 ```
-[VIP Bhop] v2.6.1 loaded: OnSimulateUserCommands+SetupMove+ProcessMovement OK, ProcessUsercmds OK, PostThink OK
+[VIP Bhop] v2.6.2 loaded: OnSimulateUserCommands+SetupMove+ProcessMovement OK, ProcessUsercmds OK, PostThink OK
 ```
 
 ## Настройка
@@ -129,33 +129,13 @@ flowchart LR
 
 | Команда | Что показывает |
 |---|---|
-| `css_vipbhop_status` | Состояние хуков, значения переменных, счётчики вызовов, время работы и состояние каждого игрока |
+| `css_vipbhop_status` | Состояние хуков и игроков, серверные и клиентские cvar, последний завершённый замер |
+| `css_vipbhop_status sample` | Запускает 10-секундный замер вызовов хуков, времени обработчиков и симуляций на тик |
 | `css_vipbhop_trace` | Порядок вызовов за 3 тика: какая функция, для какого игрока и с каким значением на входе |
 
 > В консоли игры CS2 сначала выводит `Unknown command`. Это нормально: команда всё равно уходит на сервер, ответ появится следом.
 
-<details>
-<summary><b>Как читать <code>css_vipbhop_status</code></b></summary>
-
-<br>
-
-```
-[VIP Bhop] hook: OK
-[VIP Bhop] real values: sv_autobunnyhopping=False sv_enablebunnyhopping=False, current: False/False
-[VIP Bhop] v2.6.1, ProcessUsercmds hook: OK, PostThink hook: OK
-[VIP Bhop] handler time: 159.0 ms total, 2.74 us per call (58002 calls; CSS native-to-managed dispatch not included)
-[VIP Bhop] usercmds=11515 simulate=11639 setupMove=11032 processMovement=12784 postThink=11032 vip=17845 restores=5466
-[VIP Bhop] #0 koiie: enabled=True active=True sent=True/True inMovementSet=True inControllerSet=True simulate/tick=1.00
-[VIP Bhop] #1 Malw: enabled=False active=False sent=False/False inMovementSet=False inControllerSet=False simulate/tick=1.00
-```
-
-- **`real values`** должно совпадать с вашим `server.cfg`, обычно это `False`.
-- **Счётчики вызовов** должны быть примерно равны между собой. Если `processMovement` намного больше `simulate`, команды обрабатываются повторно, и это ошибка.
-- **`restores`** — сколько раз значение VIP сбрасывалось перед другим игроком. Рост — это нормально.
-- **`simulate/tick`** у каждого игрока должен быть около `1.00`.
-- **У игрока без VIP** везде должно быть `False`.
-
-</details>
+Повторите `css_vipbhop_status` после сообщения о завершении замера. Сопоставьте `real values` с конфигурацией сервера, проверьте отправленные игрокам значения `sent` и сравните `simulate/tick` для игроков, попавших в замер. Счётчик `restores` показывает, сколько раз модуль записывал обратно серверные значения. Таймер измеряет работу обработчиков C#. Переход из движка в C# находится за пределами этого интервала.
 
 <details>
 <summary><b>Как читать <code>css_vipbhop_trace</code></b></summary>
@@ -170,7 +150,7 @@ tick 1: U1- U0*- PRE P0*+ M0*+ T0*+ S0*+ P1- M1- T1- S1- POST
 - Затем идёт номер слота игрока, `*` у VIP и значение `sv_autobunnyhopping` на входе в функцию (`+` или `-`).
 - `PRE` и `POST` — начало и конец обработки сущностей в тике.
 
-У игрока без VIP на `P` всегда должен стоять `-`. Если там `+`, значит, он получил значение VIP.
+Маркер показывает значение при входе в хук. Хук выставляет значение для текущего игрока до продолжения работы движка.
 
 </details>
 
@@ -191,9 +171,8 @@ grep -rniE "autobunnyhopping|enablebunnyhopping" game/csgo/cfg game/csgo/addons 
 
 ## Производительность
 
-Хуки срабатывают примерно 5 раз на игрока за тик. Каждый обработчик читает один параметр, делает одну проверку в `HashSet` и пишет значение по заранее сохранённому адресу.
+На каждом тике модуль обновляет состояние движения только у VIP, которым уже разрешён автобхоп, и обрабатывает ожидающие обновления cvar. Клиент получает новое значение только при его изменении. Когда ни одному живому VIP не нужно переопределение, хуки движения могут завершиться без чтения нативного аргумента. Трассировка порядка вызовов и точные тайминги включаются по запросу.
 
-Замер на живом сервере: **2,7 мкс на вызов, около 0,3 % одного ядра при трёх игроках**. Нагрузка растёт пропорционально числу игроков, при 20 игроках это около 2 %. Ещё добавляется время перехода CSS из движка в C#, в замер оно не входит. Актуальные цифры для вашего сервера показывает строка `handler time` в `css_vipbhop_status`.
 
 ## Сборка из исходников
 

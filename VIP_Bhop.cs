@@ -20,7 +20,7 @@ public class VIP_Bhop : BasePlugin
 {
     public override string ModuleAuthor => "thesamefabius, koiie111";
     public override string ModuleName => "[VIP] Bhop (native cvars)";
-    public override string ModuleVersion => "v2.6.1";
+    public override string ModuleVersion => "v2.6.2";
 
     private Bhop? _bhop;
     private IVipCoreApi? _api;
@@ -33,15 +33,37 @@ public class VIP_Bhop : BasePlugin
         if (_api == null) return;
 
         _bhop = new Bhop(this, _api);
-        _api.RegisterFeature(_bhop);
+        if (!_bhop.IsWorking)
+        {
+            _bhop.Dispose();
+            _bhop = null;
+            return;
+        }
+
+        try
+        {
+            _api.RegisterFeature(_bhop);
+            _bhop.SeedClients();
+        }
+        catch
+        {
+            Unload(hotReload);
+            throw;
+        }
     }
 
     public override void Unload(bool hotReload)
     {
         if (_bhop == null) return;
 
-        _bhop.Dispose();
-        _api?.UnRegisterFeature(_bhop);
+        try
+        {
+            _api?.UnRegisterFeature(_bhop);
+        }
+        finally
+        {
+            _bhop.Dispose();
+        }
     }
 }
 
@@ -76,55 +98,41 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
 
     private readonly ConVar? _autoBhop;
     private readonly ConVar? _enableBhop;
-    private readonly ConVarFlags _autoBhopFlags;
-    private readonly ConVarFlags _enableBhopFlags;
+    private ConVarFlags? _autoBhopFlags;
+    private ConVarFlags? _enableBhopFlags;
 
-    private readonly MemoryFunctionVoid<IntPtr, IntPtr>? _processMovement;
-    private readonly MemoryFunctionVoid<IntPtr>? _simulateUserCommands;
+    private MemoryFunctionVoid<IntPtr, IntPtr>? _processMovement;
+    private MemoryFunctionVoid<IntPtr>? _simulateUserCommands;
+    private MemoryFunctionVoid<IntPtr, IntPtr, IntPtr>? _setupMove;
 
-    // void CCSPlayer_MovementServices::SetupMove(PlayerCommand* pc, CMoveData* mv): runs right before
-    // ProcessMovement and already reads the movement cvars.
-    private readonly MemoryFunctionVoid<IntPtr, IntPtr, IntPtr>? _setupMove;
+    // ProcessUsercmds returns a pointer. A narrower managed return type corrupts the result.
+    private MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, IntPtr>? _processUsercmds;
+    private MemoryFunctionVoid<CCSPlayerPawnBase>? _postThink;
 
-    // void* CCSPlayerController::ProcessUsercmds(CUserCmd* cmds, int numcmds, bool paused, float margin)
-    // Returns a pointer: it must be declared as IntPtr, a narrower type corrupts the result.
-    private readonly MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, IntPtr>? _processUsercmds;
+    private readonly HashSet<int> _connected = new(65);
+    private readonly HashSet<int> _candidates = new(65);
+    private readonly List<int> _pendingSync = new(65);
 
-    private readonly MemoryFunctionVoid<CCSPlayerPawnBase>? _postThink;
+    // Only living, eligible VIPs are indexed here. The owner is a specific connection, not just a slot.
+    private readonly Dictionary<IntPtr, PlayerState> _activeServices = new(65);
+    private readonly Dictionary<IntPtr, PlayerState> _activeControllers = new(65);
+    private readonly Dictionary<IntPtr, PlayerState> _activePawns = new(65);
 
-    // Rebuilt every tick: MovementServices, controller and pawn pointers of VIPs with active bhop
-    private readonly HashSet<IntPtr> _activeServices = new();
-    private readonly HashSet<IntPtr> _activeControllers = new();
-    private readonly HashSet<IntPtr> _activePawns = new();
+    private BhopCvar _auto;
+    private BhopCvar _enable;
+    private bool _mapReady;
+    private bool _disposed;
+    private int _round;
 
-    // Cached addresses of the cvar values: GetPrimitiveValue costs two native calls, and the hooks below run
-    // several times per player per tick. Refreshed every tick and on map start.
-    private bool* _autoBhopValue;
-    private bool* _enableBhopValue;
+    private HookSample? _sample;
+    private HookSample? _lastSample;
+    private readonly Dictionary<IntPtr, int> _controllerSlots = new(65);
+    private readonly Dictionary<IntPtr, int> _serviceSlots = new(65);
+    private readonly Dictionary<IntPtr, int> _pawnSlots = new(65);
 
-    // Real server values, captured every tick (the override never outlives a VIP's own processing)
-    private bool _realAutoBhop;
-    private bool _realEnableBhop;
-
-    // Diagnostics (css_vipbhop_status)
-    private readonly Dictionary<IntPtr, int> _controllerSlots = new();
-    private readonly Dictionary<IntPtr, int> _serviceSlots = new();
-    private readonly Dictionary<IntPtr, int> _pawnSlots = new();
-    private long _postThinkCalls;
-
-    // css_vipbhop_trace: order of hook calls over a few ticks
     private int _traceTicksLeft;
-    private readonly List<string> _trace = new();
+    private readonly List<string> _trace = new(4);
     private System.Text.StringBuilder? _traceLine;
-    private readonly long[] _simulateBySlot = new long[65];
-    private readonly long[] _ticksBySlot = new long[65];
-    private long _simulateCalls;
-    private long _usercmdsCalls;
-    private long _preCalls;
-    private long _setupMoveCalls;
-    private long _vipCalls;
-    private long _staleRestores;
-    private long _hookTime; // Stopwatch ticks spent inside the hook handlers
 
     public Bhop(VIP_Bhop plugin, IVipCoreApi api) : base(api)
     {
@@ -135,412 +143,582 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         _enableBhop = ConVar.Find(EnableBhopName);
         if (_autoBhop == null || _enableBhop == null)
         {
-            plugin.Logger.LogError("[VIP Bhop] {0}/{1} not found, bhop is disabled", AutoBhopName, EnableBhopName);
+            plugin.Logger.LogError("[VIP Bhop] Required cvars were not found");
             return;
         }
 
-        // Per-player value at every entry point of a player's command processing. All hooks are pass-through.
         try
         {
-            _simulateUserCommands = new MemoryFunctionVoid<IntPtr>(GameData.GetSignature(SimulateUserCommandsKey));
-            _setupMove = new MemoryFunctionVoid<IntPtr, IntPtr, IntPtr>(GameData.GetSignature(SetupMoveKey));
-            _processMovement = new MemoryFunctionVoid<IntPtr, IntPtr>(GameData.GetSignature(ProcessMovementKey));
-            _simulateUserCommands.Hook(SimulateUserCommandsPre, HookMode.Pre);
-            _setupMove.Hook(SetupMovePre, HookMode.Pre);
-            _processMovement.Hook(ProcessMovementPre, HookMode.Pre);
+            RefreshCvarPointers();
+            _auto.Capture();
+            _enable.Capture();
+
+            var simulate = new MemoryFunctionVoid<IntPtr>(GameData.GetSignature(SimulateUserCommandsKey));
+            var setup = new MemoryFunctionVoid<IntPtr, IntPtr, IntPtr>(GameData.GetSignature(SetupMoveKey));
+            var movement = new MemoryFunctionVoid<IntPtr, IntPtr>(GameData.GetSignature(ProcessMovementKey));
+            simulate.Hook(SimulateUserCommandsPre, HookMode.Pre);
+            _simulateUserCommands = simulate;
+            setup.Hook(SetupMovePre, HookMode.Pre);
+            _setupMove = setup;
+            movement.Hook(ProcessMovementPre, HookMode.Pre);
+            _processMovement = movement;
+
+            InstallOptionalHooks();
+
+            _autoBhopFlags = _autoBhop.Flags;
+            _autoBhop.Flags = _autoBhopFlags.Value & ~ConVarFlags.FCVAR_REPLICATED;
+            _enableBhopFlags = _enableBhop.Flags;
+            _enableBhop.Flags = _enableBhopFlags.Value & ~ConVarFlags.FCVAR_REPLICATED;
+
+            plugin.RegisterListener<Listeners.OnClientConnected>(ResetState);
+            plugin.RegisterListener<Listeners.OnClientPutInServer>(QueueSync);
+            plugin.RegisterListener<Listeners.OnClientDisconnect>(ResetState);
+            plugin.RegisterListener<Listeners.OnClientDisconnectPost>(ResetState);
+            plugin.RegisterListener<Listeners.OnEntityDeleted>(OnEntityDeleted);
+            plugin.RegisterListener<Listeners.OnTick>(OnTick);
+            plugin.RegisterListener<Listeners.OnMapStart>(OnMapStart);
+            plugin.RegisterListener<Listeners.OnMapEnd>(OnMapEnd);
+            plugin.RegisterListener<Listeners.OnServerPostEntityThink>(OnPostEntityThink);
+            plugin.RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
+            plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
+            _mapReady = true;
         }
         catch (Exception e)
         {
-            _simulateUserCommands?.Unhook(SimulateUserCommandsPre, HookMode.Pre);
-            _setupMove?.Unhook(SetupMovePre, HookMode.Pre);
-            _simulateUserCommands = null;
-            _setupMove = null;
-            _processMovement = null;
-            plugin.Logger.LogError(e,
-                "[VIP Bhop] {0} / {1} / {2} missing or outdated in gamedata/vip_bhop.json. Bhop is disabled",
-                SimulateUserCommandsKey, SetupMoveKey, ProcessMovementKey);
+            plugin.Logger.LogError(e, "[VIP Bhop] Initialization failed. Check required signatures in gamedata/vip_bhop.json");
+            Dispose();
             return;
         }
 
-        // ProcessUsercmds is the outermost entry point (OnSimulateUserCommands runs inside it). Part of the
-        // jump handling runs there before the simulation, so without it a VIP's "true" can reach the next
-        // player. Optional: without it the module works, but that leak is possible.
-        try
-        {
-            _processUsercmds =
-                new MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, IntPtr>(
-                    GameData.GetSignature(ProcessUsercmdsKey));
-            _processUsercmds.Hook(ProcessUsercmdsPre, HookMode.Pre);
-        }
-        catch (Exception e)
-        {
-            _processUsercmds = null;
-            plugin.Logger.LogWarning(e,
-                "[VIP Bhop] {0} missing or outdated in gamedata/vip_bhop.json, VIPs may stick to the ground",
-                ProcessUsercmdsKey);
-        }
-
-        // Pawn PostThink runs per player outside the command processing (signature maintained by CSS itself).
-        // Without it a VIP's "true" can reach other players there.
-        try
-        {
-            _postThink = VirtualFunctions.CCSPlayerPawnBase_PostThinkFunc;
-            _postThink.Hook(PostThinkPre, HookMode.Pre);
-        }
-        catch (Exception e)
-        {
-            _postThink = null;
-            plugin.Logger.LogWarning(e, "[VIP Bhop] CCSPlayerPawnBase_PostThink hook failed");
-        }
-
-        RefreshCvarPointers();
-        _realAutoBhop = *_autoBhopValue;
-        _realEnableBhop = *_enableBhopValue;
-
-        _autoBhopFlags = _autoBhop.Flags;
-        _enableBhopFlags = _enableBhop.Flags;
-        _autoBhop.Flags = _autoBhopFlags & ~ConVarFlags.FCVAR_REPLICATED;
-        _enableBhop.Flags = _enableBhopFlags & ~ConVarFlags.FCVAR_REPLICATED;
-
-        plugin.RegisterListener<Listeners.OnClientConnected>(slot => ResetState(slot));
-        plugin.RegisterListener<Listeners.OnClientDisconnectPost>(slot => ResetState(slot));
-        plugin.RegisterListener<Listeners.OnTick>(OnTick);
-        plugin.RegisterListener<Listeners.OnMapStart>(_ => RefreshCvarPointers());
-        plugin.RegisterListener<Listeners.OnServerPreEntityThink>(() => Trace("PRE"));
-        plugin.RegisterListener<Listeners.OnServerPostEntityThink>(() =>
-        {
-            Trace("POST");
-            EnsureRealValues();
-        });
-        plugin.RegisterEventHandler<EventRoundStart>(OnRoundStart);
-        plugin.AddCommand("css_vipbhop_status", "VIP Bhop diagnostics (server console or @css/root)", OnStatusCommand);
-        plugin.AddCommand("css_vipbhop_trace", "VIP Bhop: hook call order for 3 ticks (server console or @css/root)", OnTraceCommand);
-
+        plugin.AddCommand("css_vipbhop_status", "VIP Bhop diagnostics ([sample], console or @css/root)", OnStatusCommand);
+        plugin.AddCommand("css_vipbhop_trace", "VIP Bhop: hook call order for 3 ticks (console or @css/root)", OnTraceCommand);
         plugin.Logger.LogInformation(
-            "[VIP Bhop] {0} loaded: OnSimulateUserCommands+SetupMove+ProcessMovement OK, ProcessUsercmds {1}, PostThink {2}",
+            "[VIP Bhop] {Version} loaded: OnSimulateUserCommands+SetupMove+ProcessMovement OK, ProcessUsercmds {Usercmds}, PostThink {PostThink}",
             plugin.ModuleVersion, _processUsercmds != null ? "OK" : "NOT FOUND", _postThink != null ? "OK" : "NOT FOUND");
     }
 
-    private bool IsWorking => _processMovement != null;
+    private void InstallOptionalHooks()
+    {
+        try
+        {
+            var usercmds = new MemoryFunctionWithReturn<IntPtr, IntPtr, int, bool, float, IntPtr>(
+                GameData.GetSignature(ProcessUsercmdsKey));
+            usercmds.Hook(ProcessUsercmdsPre, HookMode.Pre);
+            _processUsercmds = usercmds;
+        }
+        catch (Exception e)
+        {
+            _plugin.Logger.LogWarning(e, "[VIP Bhop] {Key} unavailable. VIPs may stick and per-player isolation may be incomplete",
+                ProcessUsercmdsKey);
+        }
+
+        try
+        {
+            var postThink = VirtualFunctions.CCSPlayerPawnBase_PostThinkFunc;
+            postThink.Hook(PostThinkPre, HookMode.Pre);
+            _postThink = postThink;
+        }
+        catch (Exception e)
+        {
+            _plugin.Logger.LogWarning(e, "[VIP Bhop] CCSPlayerPawnBase_PostThink hook failed");
+        }
+    }
+
+    internal bool IsWorking => !_disposed && _processMovement != null;
 
     private void RefreshCvarPointers()
     {
-        _autoBhopValue = (bool*)Unsafe.AsPointer(ref _autoBhop!.GetPrimitiveValue<bool>());
-        _enableBhopValue = (bool*)Unsafe.AsPointer(ref _enableBhop!.GetPrimitiveValue<bool>());
+        _auto.SetAddress((bool*)Unsafe.AsPointer(ref _autoBhop!.GetPrimitiveValue<bool>()));
+        _enable.SetAddress((bool*)Unsafe.AsPointer(ref _enableBhop!.GetPrimitiveValue<bool>()));
+    }
+
+    internal void SeedClients()
+    {
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (player is not { IsBot: false, IsHLTV: false }) continue;
+            QueueSync(player.Slot);
+            if (IsClientVip(player))
+                OnPlayerLoaded(player, GetClientVipGroup(player));
+        }
+    }
+
+    private void OnMapStart(string map)
+    {
+        if (!IsWorking) return;
+        RefreshCvarPointers();
+        _auto.Capture();
+        _enable.Capture();
+        _mapReady = true;
+        SeedClients();
+    }
+
+    private void OnMapEnd()
+    {
+        RestoreCvars();
+        _mapReady = false;
+        _round++;
+        StopTrace();
+        _sample = null;
+        _lastSample = null;
+        _controllerSlots.Clear();
+        for (var slot = 0; slot < _states.Length; slot++)
+            ResetState(slot);
+        _pendingSync.Clear();
+    }
+
+    private PlayerState? GetState(CCSPlayerController player)
+    {
+        if (player is not { IsValid: true, IsBot: false, IsHLTV: false }) return null;
+        var slot = player.Slot;
+        if ((uint)slot >= _states.Length) return null;
+
+        var identity = player.EntityHandle.Raw;
+        var state = _states[slot];
+        if (state.ControllerId is { } previous && previous != identity)
+        {
+            ResetState(slot);
+            state = _states[slot];
+        }
+
+        state.ControllerId = identity;
+        return state;
     }
 
     public override void OnPlayerLoaded(CCSPlayerController player, string group)
     {
-        if (!IsWorking) return;
-
-        var state = _states[player.Slot];
-        state.Enabled = PlayerHasFeature(player) && GetPlayerFeatureState(player) == FeatureState.Enabled;
+        if (!IsWorking || GetState(player) is not { } state) return;
+        var eligible = PlayerHasFeature(player);
+        if (!eligible || (state.Group != null && state.Group != group))
+            state.Generation++;
+        state.Group = group;
+        state.Enabled = eligible && GetPlayerFeatureState(player) == FeatureState.Enabled;
         if (state.Enabled)
             state.MaxSpeed = GetFeatureValue<BhopSettings>(player).MaxSpeed;
+        UpdateEligibility(player.Slot, state);
     }
 
     public override void OnPlayerRemoved(CCSPlayerController player, string group)
     {
-        if (!IsWorking) return;
-
-        _states[player.Slot].Enabled = false;
+        if (!IsWorking || GetState(player) is not { } state) return;
+        state.Generation++;
+        state.Group = null;
+        state.Enabled = false;
+        UpdateEligibility(player.Slot, state);
     }
 
     public override void OnSelectItem(CCSPlayerController player, FeatureState state)
     {
-        if (!IsWorking) return;
+        if (!IsWorking || GetState(player) is not { } current) return;
+        current.Enabled = state == FeatureState.Enabled;
+        if (current.Enabled)
+            current.MaxSpeed = GetFeatureValue<BhopSettings>(player).MaxSpeed;
+        UpdateEligibility(player.Slot, current);
+    }
 
-        _states[player.Slot].Enabled = state == FeatureState.Enabled;
+    private void UpdateEligibility(int slot, PlayerState state)
+    {
+        if (state.WantsBhop)
+            _candidates.Add(slot);
+        else
+        {
+            _candidates.Remove(slot);
+            RemoveMovement(state);
+        }
+
+        QueueSync(slot);
+    }
+
+    private void QueueSync(int slot)
+    {
+        if ((uint)slot >= _states.Length || _states[slot].PendingSync || _disposed) return;
+        _states[slot].PendingSync = true;
+        _pendingSync.Add(slot);
     }
 
     private void ResetState(int slot)
     {
-        if (slot < 0 || slot >= _states.Length) return;
+        if ((uint)slot >= _states.Length || _disposed) return;
+        var state = _states[slot];
+        if (state.PendingSync) _pendingSync.Remove(slot);
+        _connected.Remove(slot);
+        _candidates.Remove(slot);
+        RemoveMovement(state);
         _states[slot] = new PlayerState();
+    }
+
+    private HookResult OnPlayerDeath(EventPlayerDeath gameEvent, GameEventInfo info)
+    {
+        if (_activeControllers.Count != 0 && gameEvent.Userid is { IsValid: true } player &&
+            _activeControllers.TryGetValue(player.Handle, out var state) && state.ControllerId == player.EntityHandle.Raw)
+            RemoveMovement(state);
+
+        return HookResult.Continue;
+    }
+
+    private void OnEntityDeleted(CEntityInstance entity)
+    {
+        if (_activeControllers.Count == 0) return;
+        var address = entity.Handle;
+        if (_activePawns.TryGetValue(address, out var state) || _activeControllers.TryGetValue(address, out state))
+            RemoveMovement(state);
+    }
+
+    private static void RemoveAddress(Dictionary<IntPtr, PlayerState> index, IntPtr address, PlayerState state)
+    {
+        if (address != IntPtr.Zero && index.TryGetValue(address, out var owner) && ReferenceEquals(owner, state))
+            index.Remove(address);
+    }
+
+    private void RemoveMovement(PlayerState state)
+    {
+        if (state.ControllerAddress == IntPtr.Zero) return;
+        RemoveAddress(_activeControllers, state.ControllerAddress, state);
+        RemoveAddress(_activePawns, state.PawnAddress, state);
+        RemoveAddress(_activeServices, state.ServicesAddress, state);
+        state.ControllerAddress = IntPtr.Zero;
+        if (_activeControllers.Count == 0)
+            RestoreCvars();
     }
 
     private void OnTick()
     {
-        if (_traceTicksLeft > 0) FlushTraceTick();
-
-        _activeServices.Clear();
-        _activeControllers.Clear();
-        _activePawns.Clear();
-        _controllerSlots.Clear();
-        _serviceSlots.Clear();
-        _pawnSlots.Clear();
-
-        // Cheap (4 native calls per tick) and guarantees the hooks never write to a stale address
+        if (!_mapReady) return;
         RefreshCvarPointers();
-        _realAutoBhop = *_autoBhopValue;
-        _realEnableBhop = *_enableBhopValue;
-        var serverAutoBhop = _realAutoBhop;
-        var serverEnableBhop = _realEnableBhop;
-
-        foreach (var player in Utilities.GetPlayers())
+        RestoreCvars();
+        var baseChanged = _auto.Capture() | _enable.Capture();
+        if (baseChanged)
         {
-            if (player is not { IsValid: true, IsBot: false, IsHLTV: false } ||
-                player.Connected != PlayerConnectedState.Connected) continue;
+            foreach (var slot in _connected)
+                QueueSync(slot);
+        }
 
-            _controllerSlots[player.Handle] = player.Slot;
-            _ticksBySlot[player.Slot]++;
+        SyncPendingClients();
+        foreach (var slot in _candidates)
+            RefreshMovement(slot, _states[slot]);
 
-            var state = _states[player.Slot];
-            var bhop = state.Enabled && state.Active;
+        if (_traceTicksLeft > 0) FlushTraceTick();
+        if (_sample is { } sample && Server.TickCount - sample.StartTick >= HookSample.DurationTicks)
+        {
+            sample.ElapsedTicks = Server.TickCount - sample.StartTick;
+            _lastSample = sample;
+            _sample = null;
+            if (_traceLine == null) _controllerSlots.Clear();
+            Server.PrintToConsole("[VIP Bhop] sample complete. Run css_vipbhop_status for results.");
+        }
 
-            // Per-client values: only sent when they change
-            SyncClient(player, state, bhop || serverAutoBhop, bhop || serverEnableBhop);
+        if (_sample != null || _traceLine != null)
+            RefreshDiagnosticSlots();
+    }
 
-            var pawn = player.PlayerPawn.Value;
-            var services = pawn?.MovementServices;
-            if (pawn != null) _pawnSlots[pawn.Handle] = player.Slot;
-            if (services != null) _serviceSlots[services.Handle] = player.Slot;
+    private void SyncPendingClients()
+    {
+        // Keep only clients for which PutInServer arrived before the controller was ready.
+        for (var i = _pendingSync.Count - 1; i >= 0; i--)
+        {
+            var slot = _pendingSync[i];
+            var player = Utilities.GetPlayerFromSlot(slot);
+            if (player is not { IsValid: true, Connected: PlayerConnectedState.Connected }) continue;
+            _pendingSync.RemoveAt(i);
+            _states[slot].PendingSync = false;
+            if (GetState(player) is not { } state) continue;
+            _connected.Add(slot);
 
-            if (!bhop || !player.PawnIsAlive || pawn == null || services == null) continue;
-
-            _activeServices.Add(services.Handle);
-            _activeControllers.Add(player.Handle);
-            _activePawns.Add(pawn.Handle);
-
-            if (state.MaxSpeed > 0)
-                ClampSpeed(player, pawn, state.MaxSpeed);
+            if (state.NeedsAutoBhop(_auto.Baseline, out var auto))
+            {
+                player.ReplicateConVar(AutoBhopName, auto ? "true" : "false");
+                state.SentAutoBhop = auto;
+            }
+            if (state.NeedsEnableBhop(_enable.Baseline, out var enable))
+            {
+                player.ReplicateConVar(EnableBhopName, enable ? "true" : "false");
+                state.SentEnableBhop = enable;
+            }
         }
     }
 
-    private static void SyncClient(CCSPlayerController player, PlayerState state, bool autoBhop, bool enableBhop)
+    private void RefreshMovement(int slot, PlayerState state)
     {
-        if (state.SentAutoBhop != autoBhop)
+        var player = Utilities.GetPlayerFromSlot(slot);
+        if (player is not { IsValid: true, Connected: PlayerConnectedState.Connected, PawnIsAlive: true } ||
+            state.ControllerId != player.EntityHandle.Raw ||
+            player.PlayerPawn.Value is not { IsValid: true } pawn || pawn.MovementServices is not { } services)
         {
-            player.ReplicateConVar(AutoBhopName, autoBhop ? "true" : "false");
-            state.SentAutoBhop = autoBhop;
-        }
-
-        if (state.SentEnableBhop != enableBhop)
-        {
-            player.ReplicateConVar(EnableBhopName, enableBhop ? "true" : "false");
-            state.SentEnableBhop = enableBhop;
-        }
-    }
-
-    private HookResult ProcessUsercmdsPre(DynamicHook hook)
-    {
-        var start = Stopwatch.GetTimestamp();
-        _usercmdsCalls++;
-        var controller = hook.GetParam<IntPtr>(0);
-        Trace("U", _controllerSlots, controller);
-        ApplyFor(_activeControllers.Contains(controller));
-        _hookTime += Stopwatch.GetTimestamp() - start;
-        return HookResult.Continue;
-    }
-
-    private HookResult PostThinkPre(DynamicHook hook)
-    {
-        var start = Stopwatch.GetTimestamp();
-        _postThinkCalls++;
-        var pawn = hook.GetParam<IntPtr>(0);
-        Trace("T", _pawnSlots, pawn);
-        ApplyFor(_activePawns.Contains(pawn));
-        _hookTime += Stopwatch.GetTimestamp() - start;
-        return HookResult.Continue;
-    }
-
-    private HookResult SimulateUserCommandsPre(DynamicHook hook)
-    {
-        var start = Stopwatch.GetTimestamp();
-        _simulateCalls++;
-        var controller = hook.GetParam<IntPtr>(0);
-        if (_controllerSlots.TryGetValue(controller, out var slot)) _simulateBySlot[slot]++;
-        Trace("S", _controllerSlots, controller);
-
-        ApplyFor(_activeControllers.Contains(controller));
-        _hookTime += Stopwatch.GetTimestamp() - start;
-        return HookResult.Continue;
-    }
-
-    private HookResult SetupMovePre(DynamicHook hook)
-    {
-        var start = Stopwatch.GetTimestamp();
-        _setupMoveCalls++;
-        var services = hook.GetParam<IntPtr>(0);
-        Trace("P", _serviceSlots, services);
-        ApplyFor(_activeServices.Contains(services));
-        _hookTime += Stopwatch.GetTimestamp() - start;
-        return HookResult.Continue;
-    }
-
-    private HookResult ProcessMovementPre(DynamicHook hook)
-    {
-        var start = Stopwatch.GetTimestamp();
-        _preCalls++;
-        var services = hook.GetParam<IntPtr>(0);
-        Trace("M", _serviceSlots, services);
-        ApplyFor(_activeServices.Contains(services));
-        _hookTime += Stopwatch.GetTimestamp() - start;
-        return HookResult.Continue;
-    }
-
-    // Pass-through only: game functions are never called or skipped from here
-    private void ApplyFor(bool vip)
-    {
-        if (!vip)
-        {
-            EnsureRealValues();
+            RemoveMovement(state);
             return;
         }
 
-        _vipCalls++;
-        *_autoBhopValue = true;
-        *_enableBhopValue = true;
+        var controllerAddress = player.Handle;
+        var pawnAddress = pawn.Handle;
+        var servicesAddress = services.Handle;
+        var pawnId = pawn.EntityHandle.Raw;
+        if (state.ControllerAddress != controllerAddress || state.PawnAddress != pawnAddress ||
+            state.ServicesAddress != servicesAddress || state.PawnId != pawnId)
+        {
+            RemoveMovement(state);
+            state.ControllerAddress = controllerAddress;
+            state.PawnAddress = pawnAddress;
+            state.ServicesAddress = servicesAddress;
+            state.PawnId = pawnId;
+            _activeControllers[controllerAddress] = state;
+            _activePawns[pawnAddress] = state;
+            _activeServices[servicesAddress] = state;
+        }
+
+        if (state.MaxSpeed > 0)
+            ClampSpeed(player, pawn, state.MaxSpeed);
     }
 
-    // Called at every non-VIP entry point: nobody but a VIP may ever run with a value other than the real one
-    private void EnsureRealValues()
-    {
-        if (*_autoBhopValue == _realAutoBhop && *_enableBhopValue == _realEnableBhop) return;
+    private HookResult ProcessUsercmdsPre(DynamicHook hook) =>
+        ApplyMovement(hook, _activeControllers, HookEntry.Usercmds);
+    private HookResult SimulateUserCommandsPre(DynamicHook hook) =>
+        ApplyMovement(hook, _activeControllers, HookEntry.Simulate);
+    private HookResult SetupMovePre(DynamicHook hook) =>
+        ApplyMovement(hook, _activeServices, HookEntry.SetupMove);
+    private HookResult ProcessMovementPre(DynamicHook hook) =>
+        ApplyMovement(hook, _activeServices, HookEntry.Movement);
+    private HookResult PostThinkPre(DynamicHook hook) =>
+        ApplyMovement(hook, _activePawns, HookEntry.PostThink);
 
-        _staleRestores++;
-        *_autoBhopValue = _realAutoBhop;
-        *_enableBhopValue = _realEnableBhop;
+    private HookResult ApplyMovement(DynamicHook hook, Dictionary<IntPtr, PlayerState> active, HookEntry entry)
+    {
+        if (!_mapReady) return HookResult.Continue;
+        if (_sample != null || _traceLine != null)
+            return ApplyMeasuredMovement(hook, active, entry);
+
+        if (active.Count != 0 && active.ContainsKey(hook.GetParam<IntPtr>(0)))
+            ApplyVipCvars();
+        else
+            RestoreCvars();
+        return HookResult.Continue;
     }
 
-    // Trace format per tick: PRE/POST = entity think phase, U = ProcessUsercmds, S = OnSimulateUserCommands,
-    // P = SetupMove, M = ProcessMovement, T = PostThink; then the player slot, "*" for an active VIP, and the value of
-    // sv_autobunnyhopping at entry ("+" true, "-" false). A non-VIP entry with "+" means it came in with a VIP's value.
-    private void Trace(string marker) => _traceLine?.Append(marker).Append(' ');
-
-    private void Trace(string marker, Dictionary<IntPtr, int> slots, IntPtr pointer)
+    private HookResult ApplyMeasuredMovement(DynamicHook hook, Dictionary<IntPtr, PlayerState> active, HookEntry entry)
     {
-        if (_traceLine == null) return;
+        var sample = _sample;
+        var start = sample != null ? Stopwatch.GetTimestamp() : 0;
+        var address = hook.GetParam<IntPtr>(0);
+        var vip = active.ContainsKey(address);
+        var slots = entry switch
+        {
+            HookEntry.Usercmds or HookEntry.Simulate => _controllerSlots,
+            HookEntry.PostThink => _pawnSlots,
+            _ => _serviceSlots
+        };
 
-        var slot = slots.TryGetValue(pointer, out var s) ? s.ToString() : "?";
-        var vip = _activeControllers.Count > 0 &&
-                  (marker == "U" || marker == "S" ? _activeControllers.Contains(pointer)
-                      : marker == "M" || marker == "P" ? _activeServices.Contains(pointer)
-                      : _activePawns.Contains(pointer));
-        var value = *_autoBhopValue ? "+" : "-";
-        _traceLine.Append(marker).Append(slot).Append(vip ? "*" : "").Append(value).Append(' ');
+        if (_traceLine is { } line)
+        {
+            line.Append("USPMT"[(int)entry]);
+            if (slots.TryGetValue(address, out var slot)) line.Append(slot);
+            else line.Append('?');
+            if (vip) line.Append('*');
+            line.Append(_auto.Current ? '+' : '-').Append(' ');
+        }
+
+        if (vip) ApplyVipCvars();
+        else RestoreCvars();
+
+        if (sample != null)
+        {
+            sample.Calls[(int)entry]++;
+            if (vip) sample.VipCalls++;
+            if (entry == HookEntry.Simulate && slots.TryGetValue(address, out var slot))
+                sample.SimulateBySlot[slot]++;
+            sample.HookTime += Stopwatch.GetTimestamp() - start;
+        }
+        return HookResult.Continue;
+    }
+
+    private void ApplyVipCvars()
+    {
+        _auto.Override();
+        _enable.Override();
+    }
+
+    private void RestoreCvars()
+    {
+        if ((_auto.Restore() | _enable.Restore()) && _sample is { } sample)
+            sample.Restores++;
+    }
+
+    private void RefreshDiagnosticSlots()
+    {
+        _controllerSlots.Clear();
+        _serviceSlots.Clear();
+        _pawnSlots.Clear();
+        foreach (var slot in _connected)
+        {
+            var player = Utilities.GetPlayerFromSlot(slot);
+            if (player is not { IsValid: true, Connected: PlayerConnectedState.Connected }) continue;
+            _controllerSlots[player.Handle] = slot;
+            if (_sample is { } sample)
+            {
+                if (sample.ControllerIds[slot] != player.EntityHandle.Raw)
+                {
+                    sample.ControllerIds[slot] = player.EntityHandle.Raw;
+                    sample.TicksBySlot[slot] = 0;
+                    sample.SimulateBySlot[slot] = 0;
+                }
+                sample.TicksBySlot[slot]++;
+            }
+
+            if (_traceLine == null || player.PlayerPawn.Value is not { IsValid: true } pawn) continue;
+            _pawnSlots[pawn.Handle] = slot;
+            if (pawn.MovementServices is { } services) _serviceSlots[services.Handle] = slot;
+        }
+    }
+
+    private void OnPreEntityThink() => _traceLine?.Append("PRE ");
+
+    private void OnPostEntityThink()
+    {
+        _traceLine?.Append("POST ");
+        RestoreCvars();
     }
 
     private void FlushTraceTick()
     {
-        if (_traceLine != null) _trace.Add(_traceLine.ToString());
-        _traceTicksLeft--;
-        if (_traceTicksLeft > 0)
+        _trace.Add(_traceLine!.ToString());
+        if (--_traceTicksLeft > 0)
         {
-            _traceLine = new System.Text.StringBuilder();
+            _traceLine.Clear();
             return;
         }
 
-        _traceLine = null;
         Server.PrintToConsole("[VIP Bhop] trace (U=usercmds S=simulate P=setupmove M=movement T=postthink, *=VIP, +/-=autobhop at entry):");
         for (var i = 1; i < _trace.Count; i++)
             Server.PrintToConsole($"[VIP Bhop] tick {i}: {_trace[i]}");
+        StopTrace();
+    }
+
+    private void StopTrace()
+    {
+        if (_traceLine == null) return;
+        _plugin.RemoveListener<Listeners.OnServerPreEntityThink>(OnPreEntityThink);
+        _traceLine = null;
+        _traceTicksLeft = 0;
         _trace.Clear();
+        if (_sample == null) _controllerSlots.Clear();
+        _serviceSlots.Clear();
+        _pawnSlots.Clear();
     }
 
     private void OnTraceCommand(CCSPlayerController? caller, CommandInfo info)
     {
         if (caller != null && !AdminManager.PlayerHasPermissions(caller, "@css/root")) return;
+        if (!_mapReady)
+        {
+            info.ReplyToCommand("[VIP Bhop] No active map");
+            return;
+        }
 
+        if (_traceLine == null)
+            _plugin.RegisterListener<Listeners.OnServerPreEntityThink>(OnPreEntityThink);
         _trace.Clear();
         _traceLine = new System.Text.StringBuilder();
-        _traceTicksLeft = 4; // first (partial) tick is dropped
+        _traceTicksLeft = 4; // The first, partial tick is discarded.
         info.ReplyToCommand("[VIP Bhop] tracing 3 ticks, result goes to the server console");
-    }
-
-    private string HookTimeReport()
-    {
-        var calls = _usercmdsCalls + _simulateCalls + _setupMoveCalls + _preCalls + _postThinkCalls;
-        if (calls == 0) return "no calls yet";
-
-        var totalMs = _hookTime * 1000.0 / Stopwatch.Frequency;
-        return $"{totalMs:0.0} ms total, {totalMs * 1000.0 / calls:0.00} us per call ({calls} calls; " +
-               "CSS native-to-managed dispatch not included)";
     }
 
     private void OnStatusCommand(CCSPlayerController? caller, CommandInfo info)
     {
-        // server console / rcon, or a root admin from the client console
         if (caller != null && !AdminManager.PlayerHasPermissions(caller, "@css/root")) return;
-
-        info.ReplyToCommand($"[VIP Bhop] hook: {(IsWorking ? "OK" : "NOT INSTALLED")}");
-        info.ReplyToCommand(
-            $"[VIP Bhop] real values: {AutoBhopName}={_realAutoBhop} {EnableBhopName}={_realEnableBhop}, " +
-            $"current: {_autoBhop?.GetPrimitiveValue<bool>()}/{_enableBhop?.GetPrimitiveValue<bool>()}");
-        info.ReplyToCommand(
-            $"[VIP Bhop] flags: {AutoBhopName}={_autoBhop?.Flags} {EnableBhopName}={_enableBhop?.Flags}");
-        info.ReplyToCommand(
-            $"[VIP Bhop] {_plugin.ModuleVersion}, ProcessUsercmds hook: {(_processUsercmds != null ? "OK" : "NOT FOUND")}, " +
-            $"PostThink hook: {(_postThink != null ? "OK" : "NOT FOUND")}");
-        info.ReplyToCommand(
-            $"[VIP Bhop] handler time: {HookTimeReport()}");
-        info.ReplyToCommand(
-            $"[VIP Bhop] usercmds={_usercmdsCalls} simulate={_simulateCalls} setupMove={_setupMoveCalls} processMovement={_preCalls} postThink={_postThinkCalls} vip={_vipCalls} restores={_staleRestores}");
-
-        foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
+        if (info.ArgCount > 1 && info.GetArg(1).Equals("sample", StringComparison.OrdinalIgnoreCase))
         {
-            var st = _states[player.Slot];
-            info.ReplyToCommand(
-                $"[VIP Bhop] #{player.Slot} {player.PlayerName}: enabled={st.Enabled} active={st.Active} " +
-                $"sent={st.SentAutoBhop}/{st.SentEnableBhop} inMovementSet={player.PlayerPawn.Value?.MovementServices is { } ms && _activeServices.Contains(ms.Handle)} inControllerSet={_activeControllers.Contains(player.Handle)} " +
-                $"simulate/tick={(_ticksBySlot[player.Slot] == 0 ? 0 : (double)_simulateBySlot[player.Slot] / _ticksBySlot[player.Slot]):0.00}");
+            if (!_mapReady)
+                info.ReplyToCommand("[VIP Bhop] No active map");
+            else if (_sample != null)
+                info.ReplyToCommand("[VIP Bhop] A sample is already running");
+            else
+            {
+                _sample = new HookSample(Server.TickCount, _states.Length);
+                info.ReplyToCommand("[VIP Bhop] Sampling for 10 seconds of game time. Run css_vipbhop_status for results.");
+            }
+            return;
+        }
+
+        info.ReplyToCommand($"[VIP Bhop] {_plugin.ModuleVersion}, required hooks: {(IsWorking ? "OK" : "NOT INSTALLED")}, " +
+            $"ProcessUsercmds: {(_processUsercmds != null ? "OK" : "NOT FOUND")}, PostThink: {(_postThink != null ? "OK" : "NOT FOUND")}");
+        if (_mapReady)
+            info.ReplyToCommand($"[VIP Bhop] real values: {AutoBhopName}={_auto.Baseline} {EnableBhopName}={_enable.Baseline}, " +
+                $"current: {_auto.Current}/{_enable.Current}, flags: {_autoBhop?.Flags}/{_enableBhop?.Flags}");
+
+        if (_sample != null) info.ReplyToCommand("[VIP Bhop] Sample in progress");
+        if (_lastSample is { } sample)
+            info.ReplyToCommand(sample.Report());
+        else
+            info.ReplyToCommand("[VIP Bhop] No completed sample. Use css_vipbhop_status sample.");
+
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (player is not { IsBot: false, IsHLTV: false } || (uint)player.Slot >= _states.Length) continue;
+            var slot = player.Slot;
+            var state = _states[slot];
+            var simulated = _lastSample?.PlayerReport(slot, player.EntityHandle.Raw) ?? "n/a";
+            info.ReplyToCommand($"[VIP Bhop] #{slot} {player.PlayerName}: enabled={state.Enabled} active={state.Active} " +
+                $"sent={state.SentAutoBhop}/{state.SentEnableBhop} inMovementSet={state.ControllerAddress != IntPtr.Zero} " +
+                $"inControllerSet={_activeControllers.ContainsKey(player.Handle)} simulate/tick={simulated}");
         }
     }
 
     private static void ClampSpeed(CCSPlayerController player, CCSPlayerPawn pawn, float maxSpeed)
     {
-        var flags = (PlayerFlags)pawn.Flags;
-        if (!flags.HasFlag(PlayerFlags.FL_ONGROUND) || !player.Buttons.HasFlag(PlayerButtons.Jump)) return;
+        if (((PlayerFlags)pawn.Flags & PlayerFlags.FL_ONGROUND) == 0 ||
+            (player.Buttons & PlayerButtons.Jump) == 0) return;
 
         var velocity = pawn.AbsVelocity;
-        var speed = Math.Sqrt(velocity.X * velocity.X + velocity.Y * velocity.Y);
-        if (Math.Round(speed) <= maxSpeed) return;
-
-        velocity.X = (float)(velocity.X / speed) * maxSpeed;
-        velocity.Y = (float)(velocity.Y / speed) * maxSpeed;
+        if (BhopSpeed.TryClamp(velocity.X, velocity.Y, maxSpeed, out var x, out var y))
+        {
+            velocity.X = x;
+            velocity.Y = y;
+        }
     }
 
-    private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
+    private HookResult OnRoundStart(EventRoundStart gameEvent, GameEventInfo info)
     {
-        var gameRules = GetGameRules();
-        if (gameRules == null) return HookResult.Continue;
-
-        foreach (var player in Utilities.GetPlayers()
-                     .Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
+        if (!_mapReady) return HookResult.Continue;
+        var round = ++_round;
+        if (GetGameRules() is not { } rules) return HookResult.Continue;
+        var warmup = rules.WarmupPeriod;
+        var freezeTime = rules.FreezeTime;
+        foreach (var player in Utilities.GetPlayers())
         {
-            var state = _states[player.Slot];
+            if (GetState(player) is not { } state) continue;
+            var slot = player.Slot;
             state.Active = false;
-            var generation = ++state.Generation;
+            state.Enabled = IsClientVip(player) && PlayerHasFeature(player) &&
+                GetPlayerFeatureState(player) == FeatureState.Enabled;
 
-            if (!IsClientVip(player) || !PlayerHasFeature(player) ||
-                GetPlayerFeatureState(player) is not FeatureState.Enabled)
+            if (state.Enabled)
             {
-                state.Enabled = false;
-                continue;
+                var settings = GetFeatureValue<BhopSettings>(player);
+                state.MaxSpeed = settings.MaxSpeed;
+                state.Active = warmup;
+                if (!warmup)
+                {
+                    PrintToChat(player, GetTranslatedText("bhop.TimeToActivation", settings.Timer));
+                    var generation = state.Generation;
+                    _plugin.AddTimer(settings.Timer + freezeTime,
+                        () => Activate(slot, state, round, generation), TimerFlags.STOP_ON_MAPCHANGE);
+                }
             }
 
-            state.Enabled = true;
-            var settings = GetFeatureValue<BhopSettings>(player);
-            state.MaxSpeed = settings.MaxSpeed;
-
-            if (gameRules.WarmupPeriod)
-            {
-                state.Active = true;
-                continue;
-            }
-
-            PrintToChat(player, GetTranslatedText("bhop.TimeToActivation", settings.Timer));
-            _plugin.AddTimer(settings.Timer + gameRules.FreezeTime, () =>
-            {
-                // player left or a new round started meanwhile
-                if (_states[player.Slot] != state || state.Generation != generation || !player.IsValid) return;
-
-                state.Active = true;
-                PrintToChat(player, GetTranslatedText("bhop.Activated"));
-            }, TimerFlags.STOP_ON_MAPCHANGE);
+            UpdateEligibility(slot, state);
         }
 
         return HookResult.Continue;
+    }
+
+    private void Activate(int slot, PlayerState state, int round, int generation)
+    {
+        if (!_mapReady || !PlayerState.IsCurrent(_states[slot], state, _round, round, generation) ||
+            Utilities.GetPlayerFromSlot(slot) is not { IsValid: true, Connected: PlayerConnectedState.Connected } player ||
+            state.ControllerId != player.EntityHandle.Raw)
+            return;
+
+        state.Active = true;
+        UpdateEligibility(slot, state);
+        PrintToChat(player, GetTranslatedText("bhop.Activated"));
     }
 
     private static CCSGameRules? GetGameRules()
@@ -549,43 +727,44 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
             .FirstOrDefault(g => g.IsValid)?.GameRules;
     }
 
+    private static void RestoreReplicationFlag(ConVar cvar, ConVarFlags originalFlags)
+    {
+        const ConVarFlags replicated = ConVarFlags.FCVAR_REPLICATED;
+        cvar.Flags = (cvar.Flags & ~replicated) | (originalFlags & replicated);
+    }
+
     public void Dispose()
     {
-        if (_processMovement == null) return;
+        if (_disposed) return;
+        var wasReady = _mapReady;
+        _mapReady = false;
+        _disposed = true;
+        StopTrace();
+        _sample = null;
+        _controllerSlots.Clear();
+        Api.OnPlayerSpawn -= OnPlayerSpawn;
+        Api.PlayerLoaded -= OnPlayerLoaded;
+        Api.PlayerRemoved -= OnPlayerRemoved;
 
         _postThink?.Unhook(PostThinkPre, HookMode.Pre);
         _processUsercmds?.Unhook(ProcessUsercmdsPre, HookMode.Pre);
         _simulateUserCommands?.Unhook(SimulateUserCommandsPre, HookMode.Pre);
         _setupMove?.Unhook(SetupMovePre, HookMode.Pre);
-        _processMovement.Unhook(ProcessMovementPre, HookMode.Pre);
-        EnsureRealValues();
+        _processMovement?.Unhook(ProcessMovementPre, HookMode.Pre);
 
-        _autoBhop!.Flags = _autoBhopFlags;
-        _enableBhop!.Flags = _enableBhopFlags;
+        if (_autoBhopFlags is { } autoFlags) RestoreReplicationFlag(_autoBhop!, autoFlags);
+        if (_enableBhopFlags is { } enableFlags) RestoreReplicationFlag(_enableBhop!, enableFlags);
+        if (!wasReady) return;
 
-        // Return every client to the real server values
-        var autoBhop = _autoBhop.GetPrimitiveValue<bool>() ? "true" : "false";
-        var enableBhop = _enableBhop!.GetPrimitiveValue<bool>() ? "true" : "false";
-        foreach (var player in Utilities.GetPlayers().Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false }))
+        RefreshCvarPointers();
+        RestoreCvars();
+        var auto = _auto.Current ? "true" : "false";
+        var enable = _enable.Current ? "true" : "false";
+        foreach (var player in Utilities.GetPlayers())
         {
-            player.ReplicateConVar(AutoBhopName, autoBhop);
-            player.ReplicateConVar(EnableBhopName, enableBhop);
+            if (player is not { IsBot: false, IsHLTV: false }) continue;
+            player.ReplicateConVar(AutoBhopName, auto);
+            player.ReplicateConVar(EnableBhopName, enable);
         }
     }
-}
-
-public class PlayerState
-{
-    public bool Enabled { get; set; }
-    public bool Active { get; set; }
-    public float MaxSpeed { get; set; }
-    public int Generation { get; set; }
-    public bool? SentAutoBhop { get; set; }
-    public bool? SentEnableBhop { get; set; }
-}
-
-public class BhopSettings
-{
-    public float Timer { get; set; }
-    public float MaxSpeed { get; set; }
 }
