@@ -43,7 +43,6 @@ public class VIP_Bhop : BasePlugin
         try
         {
             _api.RegisterFeature(_bhop);
-            _bhop.SeedClients();
         }
         catch
         {
@@ -121,6 +120,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
     private BhopCvar _auto;
     private BhopCvar _enable;
     private bool _mapReady;
+    private bool _seedClients = true;
     private bool _disposed;
     private int _round;
 
@@ -232,7 +232,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         _enable.SetAddress((bool*)Unsafe.AsPointer(ref _enableBhop!.GetPrimitiveValue<bool>()));
     }
 
-    internal void SeedClients()
+    private void SeedClients()
     {
         foreach (var player in Utilities.GetPlayers())
         {
@@ -250,7 +250,7 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
         _auto.Capture();
         _enable.Capture();
         _mapReady = true;
-        SeedClients();
+        _seedClients = true;
     }
 
     private void OnMapEnd()
@@ -386,6 +386,14 @@ public unsafe class Bhop : VipFeatureBase, IDisposable
     private void OnTick()
     {
         if (!_mapReady) return;
+        if (_seedClients)
+        {
+            // The engine's globals are available on the first tick, even when the
+            // plugin was registered before the initial map had finished loading.
+            _seedClients = false;
+            SeedClients();
+        }
+
         RefreshCvarPointers();
         RestoreCvars();
         var baseChanged = _auto.Capture() | _enable.Capture();
