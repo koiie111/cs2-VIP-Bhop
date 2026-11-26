@@ -17,6 +17,10 @@
     </Reference>
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
+  </ItemGroup>
+
   <!-- Server-ready layout: build/addons/counterstrikesharp/{plugins/VIP_Bhop, gamedata} -->
   <Target Name="CopyToServerLayout" AfterTargets="Build">
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(MSBuildProjectDirectory)/build/addons/counterstrikesharp/plugins/VIP_Bhop" />
